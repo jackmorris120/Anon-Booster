@@ -1,0 +1,1249 @@
+package Generater.MUTMutation.Inlining;
+
+import spoon.reflect.visitor.filter.TypeFilter;
+import spoon.reflect.code.*;
+import spoon.reflect.declaration.*;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.File;
+import java.util.*;
+import java.util.stream.Collectors;
+import utils.*;
+import Generater.MUTMutation.ASTParser;
+
+import spoon.reflect.reference.*;
+import spoon.reflect.factory.Factory;
+
+public class HelperParser {
+    private final Map<String, List<CtType<?>>> fileTypeMap;
+    private final MethodInliner methodInliner;
+    private final Set<String> targetClassFqns;
+    private final Map<String, List<CtMethod<?>>> inLinedTests = new HashMap<>();
+    private static final Set<String> importStmts = new LinkedHashSet<>();
+    private Map<CtMethod<?>, Boolean> helperAnalysisCache = new HashMap<>();
+    private boolean problematicHelperFound;
+    private int setupVarCounter = 0;
+
+    public Map<String, List<CtMethod<?>>> getInLinedTests() {
+        return inLinedTests;
+    }
+
+    public static Set<String> getImportStmts() {
+        return importStmts;
+    }
+
+    public HelperParser(Map<String, List<CtType<?>>> fileTypeMap, Set<String> targetClassFqns) {
+        this.fileTypeMap = fileTypeMap;
+        if (fileTypeMap == null || fileTypeMap.isEmpty()) {
+            throw new IllegalArgumentException("fileTypeMap cannot be null or empty.");
+        }
+        this.targetClassFqns = targetClassFqns;
+        this.methodInliner = new MethodInliner(fileTypeMap.values().stream()
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("Cannot initialize MethodInliner: fileTypeMap is empty."))
+                .get(0).getFactory());
+    }
+
+    /**
+     * Extracts test file paths from bug triggering tests string using ASTParser.convertClassToPath
+     * Format: "package.Class::testMethod;package2.Class2::testMethod2"
+     * @param bugTriggeringTests String containing bug triggering tests
+     * @return Set of file paths that contain bug triggering tests
+     */
+    private static Set<String> extractBugTriggeringTestFilePaths(String bugTriggeringTests) {
+        Set<String> testFilePaths = new HashSet<>();
+        if (bugTriggeringTests == null || bugTriggeringTests.trim().isEmpty()) {
+            return testFilePaths;
+        }
+        
+        // Use ASTParser.convertClassToPath to get the actual file paths
+        List<String> filePaths = ASTParser.convertClassToPath(bugTriggeringTests);
+        testFilePaths.addAll(filePaths);
+
+        return testFilePaths;
+    }
+
+    /**
+     * Checks if a test method belongs to a file that contains bug triggering tests
+     * @param fileName The file path being processed
+     * @param bugTriggeringTestFilePaths Set of file paths that contain bug triggering tests
+     * @param limitToBugTriggeringTests Whether to limit scope to bug triggering test files
+     * @return true if tests from this file should be inlined
+     */
+    private static boolean isTestFileInBugTriggeringList(String fileName, Set<String> bugTriggeringTestFilePaths, boolean limitToBugTriggeringTests) {
+        if (!limitToBugTriggeringTests) {
+            // If limiting is disabled, inline all tests
+            return true;
+        }
+        
+        if (bugTriggeringTestFilePaths.isEmpty()) {
+            // If no bug triggering test files specified, inline all tests (backward compatibility)
+            return true;
+        }
+        
+        return bugTriggeringTestFilePaths.contains(fileName);
+    }
+
+    public void run() {
+        System.out.println("Starting helper method inlining process...");
+        long inLineStartTime = System.currentTimeMillis();
+
+        // Check if we should limit scope to bug triggering test files (file-level filtering)
+        boolean limitToBugTriggeringTestFiles = Config.LIMIT_TO_BUG_TRIGGERING_TESTS;
+        Set<String> bugTriggeringTestFilePaths = new HashSet<>();
+        
+        System.out.println("FILE-LEVEL FILTERING Configuration:");
+        System.out.println("  LIMIT_TO_BUG_TRIGGERING_TESTS: " + limitToBugTriggeringTestFiles);
+        
+        if (limitToBugTriggeringTestFiles) {
+            bugTriggeringTestFilePaths = extractBugTriggeringTestFilePaths(Config.BUGTRIGGERRING_TESTS);
+            if (!bugTriggeringTestFilePaths.isEmpty()) {
+                System.out.println("FILE-LEVEL FILTERING: Enabled - will only inline from bug triggering test files: " + bugTriggeringTestFilePaths.size() + " files");
+                for (String filePath : bugTriggeringTestFilePaths) {
+                    System.out.println("  Target file: " + filePath);
+                }
+            } else {
+                System.out.println("FILE-LEVEL FILTERING: Enabled but no bug triggering test files specified - will inline all test methods (backward compatibility)");
+            }
+        } else {
+            System.out.println("FILE-LEVEL FILTERING: Disabled - will inline all test methods from all provided files");
+        }
+
+        Map<String, List<CtMethod<?>>> testsByFile = new LinkedHashMap<>();
+        int totalTestMethods = 0;
+        int filteredTestMethods = 0;
+        
+        for (Map.Entry<String, List<CtType<?>>> entry : fileTypeMap.entrySet()) {
+            String fileName = entry.getKey();
+            List<CtType<?>> types = entry.getValue();
+            parseImportsAndPackage(fileName);
+            
+            // Check if this entire file should be processed based on bug triggering test list
+            boolean processThisFile = isTestFileInBugTriggeringList(fileName, bugTriggeringTestFilePaths, limitToBugTriggeringTestFiles);
+            
+            for (CtType<?> type : types) {
+                for (CtMethod<?> method : type.getMethods()) {
+                    if (isTestMethod(method)) {
+                        totalTestMethods++;
+                        if (processThisFile) {
+                            testsByFile.computeIfAbsent(fileName, k -> new ArrayList<>()).add(method);
+                            filteredTestMethods++;
+                            
+                            // Debug output showing which test method will be inlined
+                            String testIdentifier = method.getDeclaringType().getQualifiedName() + "::" + method.getSimpleName();
+                            String reason = limitToBugTriggeringTestFiles ? "(from bug triggering file)" : "(all tests)";
+                            // System.out.println("  [DEBUG] Will inline test: " + testIdentifier + " " + reason);
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (limitToBugTriggeringTestFiles) {
+            System.out.println("Found " + totalTestMethods + " total test methods, filtering to " + filteredTestMethods + " test methods from bug triggering files");
+        } else {
+            System.out.println("Found " + totalTestMethods + " total test methods, processing all " + filteredTestMethods + " test methods (no file-level filtering applied)");
+        }
+        
+        // Debug summary of files being processed
+        // System.out.println("\n[DEBUG] Summary of test files being inlined:");
+        // if (testsByFile.isEmpty()) {
+        //     System.out.println("  No test files will be inlined");
+        // } else {
+        //     for (Map.Entry<String, List<CtMethod<?>>> entry : testsByFile.entrySet()) {
+        //         String fileName = entry.getKey();
+        //         int testCount = entry.getValue().size();
+        //         System.out.println("  File: " + fileName + " (" + testCount + " test methods)");
+        //     }
+        // }
+
+        int maxRounds = 0;
+        for (List<CtMethod<?>> methodList : testsByFile.values()) {
+            if (methodList.size() > maxRounds)
+                maxRounds = methodList.size();
+        }
+
+        int currentCount = 0;
+        System.out.println("Max rounds for round-robin processing: " + maxRounds);
+
+        for (int i = 0; i < maxRounds; i++) {
+            for (Map.Entry<String, List<CtMethod<?>>> entry : testsByFile.entrySet()) {
+                List<CtMethod<?>> methodList = entry.getValue();
+                if (i < methodList.size()) {
+                    if (System.currentTimeMillis() - inLineStartTime > 200000 || currentCount > 3000) {
+                        System.out.println("Process stopped due to timeout or method limit : "+(System.currentTimeMillis() - inLineStartTime)+ " ms");
+                        return;
+                    }
+
+                    CtMethod<?> method = methodList.get(i);
+                    this.problematicHelperFound = false;
+                    List<CtMethod<?>> setupChain = findSetupMethodsInHierarchy(method.getDeclaringType());
+                    Collections.reverse(setupChain);
+
+                    Map<CtFieldReference<?>, CtExpression<?>> setupInitializers = new HashMap<>();
+                    List<CtStatement> allSetupStatements = new ArrayList<>();
+                    for (CtMethod<?> setup : setupChain) {
+                        setupInitializers.putAll(extractInitializersFromSetup(setup));
+                        if (setup.getBody() != null) {
+                            allSetupStatements.addAll(setup.getBody().getStatements());
+                        }
+                    }
+                    
+                    removeTryCatchAndAssertion(method);
+                    expandAndInlineRecursively(method, new HashSet<>());
+
+                    if (!this.problematicHelperFound) {
+                        inlineRequiredFieldState(method, setupInitializers, allSetupStatements, setupChain);
+                        inLinedTests.computeIfAbsent(entry.getKey(), k -> new ArrayList<>()).add(method);
+                        currentCount++;
+                    }
+
+                }
+            }
+        }
+        importStmts.add("import org.junit.*;");
+        importStmts.add("import java.util.*;");
+        importStmts.add("import junit.textui.*;");
+        importStmts.add("import static org.junit.Assert.*;");
+        System.out.println(" # of test methods processed: " + currentCount);
+    }
+
+    /**
+     * 테스트 메서드를 분석하여 '필요한 필드'와 관련된 상태(선언, 초기화, 관련 동작)만 선택적으로 인라이닝합니다.
+     * 이 메서드는 필드-필드 의존성 및 필드-지역변수 의존성을 모두 재귀적으로 분석하여 처리합니다.
+     */
+    private void inlineRequiredFieldState(CtMethod<?> method,
+            Map<CtFieldReference<?>, CtExpression<?>> setupInitializers,
+            List<CtStatement> allSetupStatements,
+            List<CtMethod<?>> setupChain) {
+
+        Factory factory = this.methodInliner.getFactory();
+        CtType<?> testClass = method.getDeclaringType();
+
+        // 단계 1: 테스트가 '직접' 사용하는 필드 집합을 찾습니다.
+        Set<CtFieldReference<?>> directlyUsedFields = new HashSet<>();
+        method.getElements(new TypeFilter<>(CtFieldAccess.class)).forEach(access -> {
+            CtFieldReference<?> fieldRef = access.getVariable();
+            if (fieldRef.getDeclaringType() != null
+                    && testClass.getReference().isSubtypeOf(fieldRef.getDeclaringType())) {
+                directlyUsedFields.add(fieldRef);
+            }
+        });
+
+        if (directlyUsedFields.isEmpty()) {
+            return;
+        }
+
+        // 단계 2: 직접 사용된 필드가 의존하는 다른 모든 필드를 재귀적으로 찾아냅니다.
+        Map<CtFieldReference<?>, List<CtFieldReference<?>>> dependencyGraph = new HashMap<>();
+        Set<CtFieldReference<?>> allRelevantFields = new HashSet<>();
+        Queue<CtFieldReference<?>> findQueue = new LinkedList<>(directlyUsedFields);
+        Set<CtFieldReference<?>> processedForGraph = new HashSet<>(directlyUsedFields);
+        allRelevantFields.addAll(directlyUsedFields);
+
+        while (!findQueue.isEmpty()) {
+            CtFieldReference<?> field = findQueue.poll();
+            dependencyGraph.putIfAbsent(field, new ArrayList<>());
+
+            CtExpression<?> initializer = setupInitializers.get(field);
+            if (initializer == null) {
+                CtField<?> fieldDecl = field.getDeclaration();
+                if (fieldDecl != null)
+                    initializer = fieldDecl.getDefaultExpression();
+            }
+
+            if (initializer != null) {
+                initializer.getElements(new TypeFilter<>(CtFieldRead.class)).stream()
+                        .map(CtFieldRead::getVariable)
+                        .filter(dep -> dep.getDeclaringType() != null
+                                && testClass.getReference().isSubtypeOf(dep.getDeclaringType()))
+                        .forEach(dependency -> {
+                            dependencyGraph.get(field).add(dependency); // 'field'는 'dependency'에 의존함
+                            if (processedForGraph.add(dependency)) {
+                                findQueue.add(dependency);
+                                allRelevantFields.add(dependency);
+                            }
+                        });
+            }
+        }
+
+        // 2-2. 위상 정렬 실행
+        List<CtFieldReference<?>> fieldsToInline = new ArrayList<>();
+        Set<CtFieldReference<?>> visited = new HashSet<>();
+        for (CtFieldReference<?> field : allRelevantFields) {
+            if (!visited.contains(field)) {
+                topologicalSortUtil(field, dependencyGraph, visited, fieldsToInline);
+            }
+        }
+
+        // 단계 3: 인라이닝할 모든 코드(지역 변수, 필드, 관련 동작)를 생성합니다.
+        List<CtStatement> statementsToInsert = new ArrayList<>();
+        Map<CtFieldReference<?>, CtLocalVariableReference<?>> fieldToLocalMap = new HashMap<>();
+        Set<CtLocalVariable<?>> alreadyDeclaredLocals = new HashSet<>(); // 중복 선언 방지용
+
+        for (CtFieldReference<?> fieldRef : fieldsToInline) {
+            // 원본 초기화문을 가져옵니다.
+            CtExpression<?> originalInitializer = setupInitializers.get(fieldRef);
+            if (originalInitializer == null) {
+                CtField<?> fieldDecl = fieldRef.getDeclaration();
+                if (fieldDecl != null)
+                    originalInitializer = fieldDecl.getDefaultExpression();
+            }
+
+            // ✨ [핵심] 복제하기 전, 원본 초기화문에서 지역 변수 의존성을 먼저 해결합니다.
+            if (originalInitializer != null) {
+                originalInitializer.getElements(new TypeFilter<>(CtVariableRead.class)).stream()
+                        .map(read -> read.getVariable().getDeclaration())
+                        .filter(Objects::nonNull) // 선언이 유효한 것만 필터링
+                        .filter(decl -> decl instanceof CtLocalVariable)
+                        .map(decl -> (CtLocalVariable<?>) decl)
+                        .filter(localDecl -> isDeclaredInSetup(localDecl, setupChain))
+                        .filter(alreadyDeclaredLocals::add) // Set에 새로 추가되는 경우만 통과 (중복 방지)
+                        .forEach(dependencyLocal -> {
+                            statementsToInsert.add(dependencyLocal.clone());
+                        });
+            }
+
+            // --- 이제 복제 및 필드 선언문 생성을 진행합니다. ---
+            CtTypeReference<?> fieldType = fieldRef.getType();
+            String fieldName = fieldRef.getSimpleName();
+            if (fieldType == null || fieldName == null)
+                continue;
+            if ("class".equals(fieldName)) {
+                continue;
+            }
+
+            CtExpression<?> finalInitializer = (originalInitializer != null) ? originalInitializer.clone() : null;
+
+            // 초기화문 내부에 중첩된 Helper Method가 있다면 재귀적으로 인라이닝합니다.
+            if (finalInitializer != null
+                    && !finalInitializer.getElements(new TypeFilter<>(CtInvocation.class)).isEmpty()) {
+                CtMethod<Void> dummyMethod = factory.createMethod();
+                dummyMethod.setBody(factory.createBlock());
+                dummyMethod.setType(factory.Type().voidType());
+
+                CtLocalVariable<?> tempHolder = factory.createLocalVariable();
+                // Preserve fully qualified type name
+                CtTypeReference<?> initializerType = finalInitializer.getType();
+                if (initializerType != null) {
+                    CtTypeReference<?> qualifiedTypeRef = factory.Type().createReference(initializerType.getQualifiedName());
+                    tempHolder.setType((CtTypeReference) qualifiedTypeRef);
+                } else {
+                    tempHolder.setType((CtTypeReference)initializerType);
+                }
+                tempHolder.setSimpleName("__temp_holder__");
+                tempHolder.setDefaultExpression((CtExpression)finalInitializer);
+                dummyMethod.getBody().addStatement(tempHolder);
+
+                expandAndInlineRecursively(dummyMethod, new HashSet<>());
+
+                List<CtStatement> generatedStmts = dummyMethod.getBody().getStatements();
+                if (!generatedStmts.isEmpty()) {
+                    CtLocalVariable<?> finalHolder = (CtLocalVariable<?>) generatedStmts
+                            .remove(generatedStmts.size() - 1);
+
+                    // Collect ALL fields used in inlined code and replace them with local variables
+                    Map<String, CtFieldReference<?>> fieldsToLocalizeMap = new HashMap<>();
+
+                    for (CtStatement stmt : generatedStmts) {
+                        for (CtFieldAccess<?> fieldAccess : stmt.getElements(new TypeFilter<>(CtFieldAccess.class))) {
+                            CtFieldReference<?> accessedField = fieldAccess.getVariable();
+                            if (accessedField != null) {
+                                String fieldSimpleName = accessedField.getSimpleName();
+                                // Collect all fields (regardless of access modifiers)
+                                fieldsToLocalizeMap.put(fieldSimpleName, accessedField);
+                            }
+                        }
+                    }
+
+                    // Replace all field accesses with local variables
+                    for (Map.Entry<String, CtFieldReference<?>> entry : fieldsToLocalizeMap.entrySet()) {
+                        String fieldNameToLocalize = entry.getKey();
+                        CtFieldReference<?> fieldRefToLocalize = entry.getValue();
+
+                        // Create local variable declaration with the same type as the field
+                        CtLocalVariable<?> localVarDecl = factory.createLocalVariable();
+                        CtTypeReference<?> fieldTypeToLocalize = fieldRefToLocalize.getType();
+                        if (fieldTypeToLocalize != null) {
+                            CtTypeReference<?> qualifiedType = factory.Type().createReference(fieldTypeToLocalize.getQualifiedName());
+                            localVarDecl.setType((CtTypeReference) qualifiedType);
+
+                            // Set appropriate initializer based on type
+                            CtExpression<?> initializer = null;
+                            if (fieldTypeToLocalize.isPrimitive()) {
+                                // Primitive types: set default values
+                                switch (fieldTypeToLocalize.getSimpleName()) {
+                                    case "boolean":
+                                        initializer = factory.createLiteral(false);
+                                        break;
+                                    case "byte":
+                                        initializer = factory.createLiteral((byte) 0);
+                                        break;
+                                    case "short":
+                                        initializer = factory.createLiteral((short) 0);
+                                        break;
+                                    case "int":
+                                        initializer = factory.createLiteral(0);
+                                        break;
+                                    case "long":
+                                        initializer = factory.createLiteral(0L);
+                                        break;
+                                    case "float":
+                                        initializer = factory.createLiteral(0.0f);
+                                        break;
+                                    case "double":
+                                        initializer = factory.createLiteral(0.0d);
+                                        break;
+                                    case "char":
+                                        initializer = factory.createLiteral('\u0000');
+                                        break;
+                                }
+                            } else {
+                                // Reference types: initialize to null
+                                initializer = factory.createLiteral(null);
+                            }
+
+                            if (initializer != null) {
+                                localVarDecl.setDefaultExpression((CtExpression) initializer);
+                            }
+                        }
+                        localVarDecl.setSimpleName(fieldNameToLocalize);
+
+                        // Add local variable declaration at the beginning
+                        statementsToInsert.add(localVarDecl);
+
+                        // Replace all field accesses with local variable accesses
+                        for (CtStatement stmt : generatedStmts) {
+                            for (CtFieldAccess<?> fieldAccess : stmt.getElements(new TypeFilter<>(CtFieldAccess.class))) {
+                                if (fieldAccess.getVariable().getSimpleName().equals(fieldNameToLocalize)) {
+                                    // Replace field access with local variable access
+                                    CtVariableRead<?> localVarRead = factory.createVariableRead();
+                                    localVarRead.setVariable((CtVariableReference) localVarDecl.getReference());
+                                    fieldAccess.replace(localVarRead);
+                                }
+                            }
+                        }
+                    }
+
+                    finalInitializer = finalHolder.getDefaultExpression();
+                    generatedStmts.forEach(stmt -> statementsToInsert.add(stmt.clone()));
+                }
+            }
+
+            // 최종적으로 필드를 지역 변수로 선언하는 문장을 만듭니다.
+            CtLocalVariable<?> localVar = factory.createLocalVariable();
+            // Preserve fully qualified type name
+            CtTypeReference<?> qualifiedFieldTypeRef = factory.Type().createReference(fieldType.getQualifiedName());
+            localVar.setType((CtTypeReference) qualifiedFieldTypeRef);
+            localVar.setSimpleName(fieldName);
+            if (finalInitializer != null) {
+                localVar.setDefaultExpression((CtExpression)finalInitializer);
+            } else {
+                // 새로운 로직: 초기값이 없을 때
+                if (fieldType.isPrimitive()) {
+                    // 타입이 원시 타입일 경우, 이름에 따라 적절한 기본값을 할당합니다.
+                    switch (fieldType.getSimpleName()) {
+                        case "boolean":
+                            localVar.setDefaultExpression((CtExpression) factory.createLiteral(false));
+                            break;
+                        case "byte":
+                            localVar.setDefaultExpression((CtExpression) factory.createLiteral((byte) 0));
+                            break;
+                        case "short":
+                            localVar.setDefaultExpression((CtExpression) factory.createLiteral((short) 0));
+                            break;
+                        case "int":
+                            localVar.setDefaultExpression((CtExpression) factory.createLiteral(0));
+                            break;
+                        case "long":
+                            localVar.setDefaultExpression((CtExpression) factory.createLiteral(0L));
+                            break;
+                        case "float":
+                            localVar.setDefaultExpression((CtExpression) factory.createLiteral(0.0f));
+                            break;
+                        case "double":
+                            localVar.setDefaultExpression((CtExpression) factory.createLiteral(0.0d));
+                            break;
+                        case "char":
+                            localVar.setDefaultExpression((CtExpression) factory.createLiteral('\u0000'));
+                            break;
+                    }
+                } else {
+                    // 원시 타입이 아닌 모든 참조(객체) 타입은 null로 초기화합니다.
+                    localVar.setDefaultExpression((CtExpression) factory.createLiteral(null));
+                }
+                // (int, long 등 다른 원시 타입은 초기화 없이 선언만 해도 0으로 자동 초기화되므로 별도 처리가 불필요합니다.)
+            }
+            statementsToInsert.add(localVar);
+            fieldToLocalMap.put(fieldRef, localVar.getReference());
+        }
+
+        // 단계 4: 최종 생성된 코드를 메서드 본문에 삽입하고, 모든 필드 접근을 지역 변수 접근으로 교체합니다.
+        method.getBody().getStatements().addAll(0, statementsToInsert);
+        replaceFieldAccesses(method, fieldToLocalMap, factory);
+    }
+
+    /**
+     * [수정] isParentOf 대신 부모 노드를 순회하는 안정적인 방식으로 변경
+     */
+    private boolean isDeclaredInSetup(CtLocalVariable<?> localDecl, List<CtMethod<?>> setupChain) {
+        for (CtMethod<?> setupMethod : setupChain) {
+            CtBlock<?> setupBody = setupMethod.getBody();
+            if (setupBody == null) {
+                continue;
+            }
+            // localDecl의 부모를 따라 올라가면서 setupBody와 일치하는지 확인
+            CtElement currentParent = localDecl.getParent();
+            while (currentParent != null && !(currentParent instanceof CtType)) {
+                if (currentParent.equals(setupBody)) {
+                    return true;
+                }
+                currentParent = currentParent.getParent();
+            }
+        }
+        return false;
+    }
+
+    // HelperParser.java 클래스 내부에 추가
+
+    /**
+     * 위상 정렬을 수행하기 위한 재귀 헬퍼 메서드 (DFS 기반)
+     * 
+     * @param field           현재 방문 중인 필드
+     * @param dependencyGraph 필드 의존성 그래프
+     * @param visited         이미 방문한 필드 집합
+     * @param sortedList      정렬된 결과가 담길 리스트
+     */
+    private void topologicalSortUtil(CtFieldReference<?> field,
+            Map<CtFieldReference<?>, List<CtFieldReference<?>>> dependencyGraph,
+            Set<CtFieldReference<?>> visited,
+            List<CtFieldReference<?>> sortedList) {
+        visited.add(field);
+
+        // 현재 필드가 의존하는 다른 모든 필드를 먼저 방문
+        List<CtFieldReference<?>> dependencies = dependencyGraph.get(field);
+        if (dependencies != null) {
+            for (CtFieldReference<?> dependency : dependencies) {
+                if (!visited.contains(dependency)) {
+                    topologicalSortUtil(dependency, dependencyGraph, visited, sortedList);
+                }
+            }
+        }
+
+        // 모든 의존성 방문이 끝나면, 현재 필드를 결과 리스트에 추가
+        sortedList.add(field);
+    }
+
+    private Pair<Integer, Map<String, String>> inlineSetupLocalContext(CtMethod<?> method,
+            List<CtMethod<?>> setupChain) {
+        List<CtStatement> statementsToInsert = new ArrayList<>();
+        Map<String, String> renameMap = new HashMap<>();
+
+        for (CtMethod<?> setupMethod : setupChain) {
+            if (setupMethod.getBody() == null)
+                continue;
+
+            CtBlock<?> bodyClone = setupMethod.getBody().clone();
+            // ✨ 여기서 renameMap이 채워집니다.
+            renameSetupLocalVariables(bodyClone, renameMap);
+
+            for (CtStatement stmt : bodyClone.getStatements()) {
+                if (stmt instanceof CtAssignment && ((CtAssignment<?, ?>) stmt).getAssigned() instanceof CtFieldWrite) {
+                    continue;
+                }
+                statementsToInsert.add(stmt.clone());
+            }
+        }
+        method.getBody().getStatements().addAll(0, statementsToInsert);
+
+        // ✨ 삽입된 문장 수와, 이름 변경 맵을 함께 반환합니다.
+        return new Pair<>(statementsToInsert.size(), renameMap);
+    }
+
+
+    private void renameSetupLocalVariables(CtBlock<?> body, Map<String, String> renameMap) {
+        // 스코프 충돌을 피하기 위해 각 선언을 개별적으로 처리합니다.
+        Set<CtLocalVariable<?>> alreadyRenamed = new HashSet<>();
+        // 처리 도중 리스트가 변경될 수 있으므로 복사본을 순회합니다.
+        List<CtLocalVariable<?>> declarations = new ArrayList<>(body.getElements(new TypeFilter<>(CtLocalVariable.class)));
+    
+        for (CtLocalVariable<?> varDecl : declarations) {
+            if (alreadyRenamed.contains(varDecl)) {
+                continue;
+            }
+    
+            String oldName = varDecl.getSimpleName();
+            String newName = oldName + "_setup_" + (this.setupVarCounter++);
+    
+            // 맵에 [원본 이름, 새 이름]을 기록하여 다른 단계와 정보를 공유합니다.
+            renameMap.put(oldName, newName);
+    
+            // 변수가 선언된 가장 가까운 스코프(블록 또는 루프)를 찾습니다.
+            CtElement scope = varDecl.getParent(p -> p instanceof CtStatementList);
+            if (scope == null) {
+                scope = body; // 적절한 스코프를 못 찾으면 몸통 전체를 스코프로 간주
+            }
+    
+            // 찾은 스코프 '내부'에서만 이름이 같은 변수 사용처를 찾아 이름을 변경합니다.
+            for (CtVariableAccess<?> access : scope.getElements(new TypeFilter<>(CtVariableAccess.class))) {
+                CtVariableReference<?> varRef = access.getVariable();
+                if (varRef != null && oldName.equals(varRef.getSimpleName())) {
+                    CtVariable<?> accessDecl = varRef.getDeclaration();
+                    // 이 사용처가 현재 처리 중인 선언을 가리키거나, 링크가 깨져 주인을 알 수 없을 때만 변경
+                    if (accessDecl == null || accessDecl.equals(varDecl)) {
+                        varRef.setSimpleName(newName);
+                    }
+                }
+            }
+            
+            // 마지막으로 변수 '선언' 자체의 이름을 변경합니다.
+            varDecl.setSimpleName(newName);
+            
+            alreadyRenamed.add(varDecl);
+        }
+    }
+
+    private void replaceFieldAccesses(CtMethod<?> method, Map<CtFieldReference<?>, CtLocalVariableReference<?>> map,
+            Factory factory) {
+        if (map.isEmpty())
+            return;
+        method.getElements(new TypeFilter<>(CtFieldRead.class)).stream()
+                .filter(fieldRead -> map.containsKey(fieldRead.getVariable()))
+                .forEach(fieldRead -> fieldRead
+                        .replace(factory.createVariableRead(map.get(fieldRead.getVariable()), false)));
+        method.getElements(new TypeFilter<>(CtFieldWrite.class)).stream()
+                .filter(fieldWrite -> map.containsKey(fieldWrite.getVariable()))
+                .forEach(fieldWrite -> fieldWrite
+                        .replace(factory.createVariableWrite(map.get(fieldWrite.getVariable()), false)));
+    }
+
+    /**
+     * setUp 메서드를 분석하여 필드 초기화 표현식을 추출합니다.
+     * 
+     * @param setupMethod 분석할 setUp 메서드
+     * @return [필드 참조, 초기화 표현식] 맵
+     */
+    private Map<CtFieldReference<?>, CtExpression<?>> extractInitializersFromSetup(CtMethod<?> setupMethod) {
+        Map<CtFieldReference<?>, CtExpression<?>> initializers = new HashMap<>();
+        if (setupMethod.getBody() == null)
+            return initializers;
+
+        for (CtAssignment<?, ?> assignment : setupMethod.getBody().getElements(new TypeFilter<>(CtAssignment.class))) {
+
+            if (assignment.getAssigned() instanceof CtFieldWrite) {
+                CtFieldWrite<?> fieldWrite = (CtFieldWrite<?>) assignment.getAssigned();
+                CtFieldReference<?> fieldRef = fieldWrite.getVariable();
+                CtExpression<?> expression = assignment.getAssignment(); // 우변(초기값)
+
+                initializers.put(fieldRef, expression);
+                // System.out.println("[DEBUG][Setup] Extracted initializer for field '" +
+                // fieldRef.getSimpleName() + "'");
+            }
+        }
+        return initializers;
+    }
+
+    private List<CtMethod<?>> findSetupMethodsInHierarchy(CtType<?> aClass) {
+        List<CtMethod<?>> setupMethods = new ArrayList<>();
+        CtType<?> currentClass = aClass;
+
+        while (currentClass != null) {
+            // 현재 클래스에 직접 선언된 설정 메서드를 찾습니다.
+            for (CtMethod<?> method : currentClass.getMethods()) {
+                // 상속된 메서드는 건너뛰고, 현재 클래스에 직접 선언된 메서드만 처리합니다.
+                if (!method.getDeclaringType().equals(currentClass)) {
+                    continue;
+                }
+                boolean isSetupMethod = false;
+                // 애너테이션 확인
+                for (CtAnnotation<?> annotation : method.getAnnotations()) {
+                    String annotationName = annotation.getAnnotationType().getQualifiedName();
+                    if ("org.junit.Before".equals(annotationName)
+                            || "org.junit.jupiter.api.BeforeEach".equals(annotationName)) {
+                        isSetupMethod = true;
+                        break;
+                    }
+                }
+                // 이름 확인
+                if (!isSetupMethod && "setUp".equals(method.getSimpleName()) && method.getParameters().isEmpty()) {
+                    isSetupMethod = true;
+                }
+
+                if (isSetupMethod) {
+                    setupMethods.add(method);
+                    // System.out.println("[DEBUG][Setup] Found setup method in hierarchy: " +
+                    // method.getSignature());
+                    break; // 한 클래스에는 하나의 설정 메서드만 있다고 가정
+                }
+            }
+            // 부모 클래스로 이동
+            CtTypeReference<?> superClassRef = currentClass.getSuperclass();
+            currentClass = (superClassRef != null) ? superClassRef.getDeclaration() : null;
+        }
+        return setupMethods;
+    }
+
+    private static void parseImportsAndPackage(String testFile) {
+        // System.out.println("Parsing Imports and Package from: " + testFile);
+        try (BufferedReader br = new BufferedReader(new FileReader(testFile))) {
+            String line;
+            StringBuilder sb = new StringBuilder();
+            while ((line = br.readLine()) != null) {
+                String trim = line.trim();
+                if (trim.endsWith(";")) {
+                    sb.append(trim).append(" ");
+                    String stmt = sb.toString().replaceAll("\\s+", " ");
+                    if (stmt.startsWith("import ")) {
+                        String low = stmt.toLowerCase();
+                        if (!low.contains(".junit.") && !low.contains("test") && !low.contains("assert")) {
+                            importStmts.add(stmt.trim());
+                        }
+                    }
+                    sb.setLength(0);
+                } else if (!trim.isEmpty()) {
+                    sb.append(trim).append(" ");
+                }
+            }
+        } catch (Exception e) {
+            // e.printStackTrace();
+        }
+    }
+
+    private static boolean containsProblematicNestedClass(CtMethod<?> m) {
+        boolean hasProblematicType = m.getElements(new TypeFilter<CtTypeReference>(CtTypeReference.class)).stream()
+                .map(CtTypeReference::getQualifiedName)
+                .filter(q -> q != null)
+                .anyMatch(q -> (q.contains("$")));
+
+        return hasProblematicType;
+    }
+
+    private void expandAndInlineRecursively(CtMethod<?> method, Set<String> callStack) {
+        final int MAX_INLINE_ITERATIONS = 100; // 무한 루프 방지를 위한 안전장치
+        int iteration = 0;
+        final Map<String, Integer> inlineCounts = new HashMap<>();
+        final int INLINE_THRESHOLD = 30;
+
+        int inlineVarIndex = 0;
+
+        // Debug: Check if this is testMultiple
+        while (iteration++ < MAX_INLINE_ITERATIONS) {
+            if (this.problematicHelperFound) {
+                // System.out.println(" -> SKIPPED: Problematic helper found, stopping
+                // expansion.");
+                break;
+            }
+
+            List<CtInvocation<?>> candidates = new ArrayList<>();
+            List<CtInvocation<?>> allInvocations = method.getElements(new TypeFilter<>(CtInvocation.class));
+
+            for (CtInvocation<?> inv : allInvocations) {
+                boolean isHelper = isHelperCallToInline(inv, callStack);
+                if (isHelper) {
+                    candidates.add(inv);
+                }
+            }
+
+            if (candidates.isEmpty()) {
+                break;
+            }
+
+            CtInvocation<?> innermostHelper = null;
+            for (CtInvocation<?> candidate : candidates) {
+                boolean hasNestedHelper = candidate.getArguments().stream()
+                        .anyMatch(arg -> arg.getElements(new TypeFilter<>(CtInvocation.class))
+                                .stream()
+                                .anyMatch(nestedInv -> candidates.contains(nestedInv)));
+                if (!hasNestedHelper) {
+                    innermostHelper = candidate;
+                    break;
+                }
+            }
+
+            if (innermostHelper == null) {
+                System.err.println(
+                        "Could not determine a definitive innermost helper. Halting inlining for this method.");
+                break;
+            }
+
+            String helperSignature = innermostHelper.getExecutable().getSignature();
+            int currentCount = inlineCounts.getOrDefault(helperSignature, 0);
+            if (currentCount >= INLINE_THRESHOLD) {
+                callStack.add(helperSignature);
+                continue;
+            }
+            inlineCounts.put(helperSignature, currentCount + 1);
+            CtTypeReference<?> returnType = innermostHelper.getExecutable().getType();
+            String typeName = sanitizeTypeName(returnType.getSimpleName());
+            String newVarName = typeName + "_var_" + inlineVarIndex++;
+
+            boolean wasInlined = methodInliner.inline(innermostHelper, newVarName, iteration);
+
+            if (!wasInlined) {
+                System.err.println("FATAL: Inlining failed for [" + helperSignature + "]. Halting.");
+                break;
+            }
+        }
+    }
+
+    private String sanitizeTypeName(String typeSimpleName) {
+        if (typeSimpleName == null || typeSimpleName.isEmpty()) {
+            return "object";
+        }
+
+        if (typeSimpleName.contains("[]")) {
+            typeSimpleName = typeSimpleName.replace("[]", "_array");
+        }
+
+        int genericStartIndex = typeSimpleName.indexOf('<');
+        if (genericStartIndex != -1) {
+            String baseType = typeSimpleName.substring(0, genericStartIndex);
+            typeSimpleName = baseType + "_gene";
+        }
+
+        if (typeSimpleName.isEmpty()) {
+            return "object";
+        }
+        return Character.toLowerCase(typeSimpleName.charAt(0)) + typeSimpleName.substring(1);
+    }
+
+
+    
+    // Replace the existing method in HelperParser.java with this one.
+    private boolean isHelperCallToInline(CtInvocation<?> invocation, Set<String> callStack) {
+        if (invocation.getExecutable() == null) {
+            return false;
+        }
+
+        // Debug: Check if this is objectMapper() call
+        String methodName = invocation.getExecutable().getSimpleName();
+
+        CtExecutable<?> declaration = invocation.getExecutable().getDeclaration();
+        if (declaration == null) {
+           
+            // Declaration not found - method might be in a parent class not fully loaded
+            // Try to find it in the type hierarchy
+            if (invocation.getTarget() != null) {
+                CtTypeReference<?> targetType = invocation.getTarget().getType();
+                
+                if (targetType != null) {
+                    CtType<?> targetTypeDecl = targetType.getDeclaration();
+                    
+                    if (targetTypeDecl != null) {
+                        // Try to find the method in the type hierarchy
+                        CtMethod<?> foundMethod = findMethodInHierarchy(targetTypeDecl,
+                            invocation.getExecutable().getSimpleName(),
+                            invocation.getExecutable().getParameters());
+                        
+                        if (foundMethod != null) {
+                            declaration = foundMethod;
+                        }
+                    }
+                }
+            } else {
+                
+            }
+
+            // If still not found, cannot inline
+            if (declaration == null) {
+                
+                return false;
+            }
+        } else {
+            
+        }
+
+        if (!(declaration instanceof CtMethod)) {
+            
+            return false;
+        }
+
+        CtMethod<?> calledMethod = (CtMethod<?>) declaration;
+
+        
+
+        if (callStack.contains(calledMethod.getSignature())) {
+            
+            return false;
+        }
+
+        if (helperAnalysisCache.containsKey(calledMethod)) {
+            if (!helperAnalysisCache.get(calledMethod) && containsProblematicNestedClass(calledMethod)) {
+                this.problematicHelperFound = true;
+            }
+            boolean cached = helperAnalysisCache.get(calledMethod);
+            
+            return cached;
+        }
+
+        CtType<?> declaringClass = calledMethod.getDeclaringType();
+        if (declaringClass == null) {
+            
+            helperAnalysisCache.put(calledMethod, false);
+            return false;
+        }
+
+        String declaringClassFqn = declaringClass.getQualifiedName();
+        
+        // Check if declaring class or any of its subclasses in the hierarchy is in targetClassFqns
+        if (!isInTargetClassHierarchy(declaringClass)) {
+            
+            helperAnalysisCache.put(calledMethod, false);
+            return false;
+        }
+
+        if (calledMethod.isAbstract() || calledMethod.getBody() == null) {
+            
+            helperAnalysisCache.put(calledMethod, false);
+            return false;
+        }
+
+        if (isTestMethod(calledMethod) || isFixtureMethod(calledMethod)) {
+            
+            helperAnalysisCache.put(calledMethod, false);
+            return false;
+        }
+
+        if (containsProblematicNestedClass(calledMethod)) {
+            
+            this.problematicHelperFound = true;
+            helperAnalysisCache.put(calledMethod, false);
+            return false;
+        }
+
+        
+        helperAnalysisCache.put(calledMethod, true);
+        return true;
+    }
+
+    /**
+     * Check if the given class or any of its subclasses in the hierarchy is in targetClassFqns.
+     * This allows inlining helper methods from parent classes like BaseMapTest, BaseTest, etc.
+     */
+    private boolean isInTargetClassHierarchy(CtType<?> declaringClass) {
+        // First check if the declaring class itself is in targetClassFqns
+        if (targetClassFqns.contains(declaringClass.getQualifiedName())) {
+            return true;
+        }
+
+        // Check if any subclass of declaringClass is in targetClassFqns
+        // This handles the case where BaseMapTest is extended by TestTreeMapperDeserializer
+        for (String targetFqn : targetClassFqns) {
+            // Find the target class in fileTypeMap
+            for (List<CtType<?>> types : fileTypeMap.values()) {
+                for (CtType<?> type : types) {
+                    if (targetFqn.equals(type.getQualifiedName())) {
+                        // Check if this target class is a subtype of declaringClass
+                        if (isSubtypeOf(type, declaringClass)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if subclass is a subtype of superclass (including transitive inheritance).
+     */
+    private boolean isSubtypeOf(CtType<?> subclass, CtType<?> superclass) {
+        CtType<?> current = subclass;
+        while (current != null) {
+            if (current.getQualifiedName().equals(superclass.getQualifiedName())) {
+                return true;
+            }
+            // Move to parent class
+            CtTypeReference<?> superClassRef = current.getSuperclass();
+            if (superClassRef != null) {
+                current = superClassRef.getDeclaration();
+            } else {
+                break;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Find a type in fileTypeMap by its qualified name.
+     */
+    private CtType<?> findTypeInFileTypeMap(String qualifiedName) {
+        for (List<CtType<?>> types : fileTypeMap.values()) {
+            for (CtType<?> type : types) {
+                if (type.getQualifiedName().equals(qualifiedName)) {
+                    return type;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Find a method in the class hierarchy by name and parameter types.
+     */
+    private CtMethod<?> findMethodInHierarchy(CtType<?> type, String methodName, List<CtTypeReference<?>> paramTypes) {
+    
+
+        CtType<?> current = type;
+        int level = 0;
+        while (current != null) {
+            
+            // Check methods in current class
+            for (CtMethod<?> method : current.getMethods()) {
+                
+                if (method.getSimpleName().equals(methodName)) {
+                    // Check parameter types match
+                    List<CtParameter<?>> params = method.getParameters();
+                    
+                    if (params.size() == paramTypes.size()) {
+                        boolean paramsMatch = true;
+                        for (int i = 0; i < params.size(); i++) {
+                            CtTypeReference<?> paramType = params.get(i).getType();
+                            CtTypeReference<?> expectedType = paramTypes.get(i);
+                            if (paramType != null && expectedType != null) {
+                                if (!paramType.getQualifiedName().equals(expectedType.getQualifiedName())) {
+                                    paramsMatch = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (paramsMatch) {
+                           
+                            return method;
+                        }
+                    }
+                }
+            }
+
+            // Move to parent class
+            CtTypeReference<?> superClassRef = current.getSuperclass();
+          
+            if (superClassRef != null) {
+                CtType<?> superDecl = superClassRef.getDeclaration();
+               
+                // If declaration is null, try to find the class in fileTypeMap
+                if (superDecl == null) {
+                    String superClassName = superClassRef.getQualifiedName();
+                    
+                }
+
+                current = superDecl;
+            } else {
+                break;
+            }
+            level++;
+        }
+
+        return null;
+    }
+
+    private static boolean containsThisOrSuper(CtMethod<?> method) {
+        if (!method.getElements(new TypeFilter<>(CtThisAccess.class)).isEmpty()) {
+            return true;
+        }
+        if (!method.getElements(new TypeFilter<>(CtSuperAccess.class)).isEmpty()) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isFixtureMethod(CtMethod<?> method) {
+        // Check for common JUnit 4/5 annotations
+        for (CtAnnotation<?> annotation : method.getAnnotations()) {
+            String annotationName = annotation.getAnnotationType().getSimpleName();
+            if (annotationName.equals("Before") ||
+                    annotationName.equals("After") ||
+                    annotationName.equals("BeforeClass") ||
+                    annotationName.equals("AfterClass") ||
+                    annotationName.equals("BeforeEach") || // JUnit 5
+                    annotationName.equals("AfterEach")) { // JUnit 5
+                return true;
+            }
+        }
+
+        // Check for common name conventions (e.g., JUnit 3)
+        String methodName = method.getSimpleName();
+        if (methodName.equals("setUp") || methodName.equals("tearDown")) {
+            return true;
+        }
+
+        return false;
+    }
+
+    public static boolean isTestMethod(CtMethod<?> method) {
+        boolean hasTestAnnotation = method.getAnnotations().stream()
+                .anyMatch(a -> a.getAnnotationType().getSimpleName().equals("Test"));
+
+        String simpleName = method.getSimpleName();
+        boolean isJunitStyle = simpleName.startsWith("test");
+
+        return method.isPublic() && (hasTestAnnotation || isJunitStyle)
+                && method.getParameters().isEmpty() && method.getBody() != null
+                && !method.getBody().getStatements().isEmpty();
+    }
+
+    private static void removeTryCatchAndAssertion(CtMethod<?> testcase) {
+        if (testcase == null || testcase.getBody() == null) {
+            return;
+        }
+
+        List<CtAnnotation<?>> annotations = testcase.getElements(new TypeFilter<>(CtAnnotation.class));
+        for (int i = annotations.size() - 1; i >= 0; i--) {
+            CtAnnotation<?> annotation = annotations.get(i);
+            if (annotation.isParentInitialized()
+                    && Override.class.getName().equals(annotation.getAnnotationType().getQualifiedName())) {
+                annotation.delete();
+            }
+        }
+
+        List<CtStatement> newStatements = processStatementList(testcase.getBody().getStatements());
+        testcase.getBody().setStatements(newStatements);
+    }
+
+    private static List<CtStatement> processStatementList(List<CtStatement> statements) {
+        if (statements == null)
+            return new ArrayList<>();
+        List<CtStatement> result = new ArrayList<>();
+        for (CtStatement stmt : statements) {
+            result.addAll(processSingleStatement(stmt));
+        }
+        return result;
+    }
+
+    /**
+     * 단일 구문(statement)을 처리하여 Assertion, try-catch 등을 제거하고 필요한 부분만 남깁니다.
+     * "not a statement" 오류를 방지하는 로직이 포함되어 있습니다.
+     */
+    private static List<CtStatement> processSingleStatement(CtStatement statement) {
+        if (statement instanceof CtInvocation && isAssertionInvocation((CtInvocation<?>) statement)) {
+            CtInvocation<?> assertion = (CtInvocation<?>) statement;
+            List<CtStatement> extractedInvocations = new ArrayList<>();
+        
+            for (CtExpression<?> arg : assertion.getArguments()) {
+                for (CtInvocation<?> call : arg.getElements(new TypeFilter<>(CtInvocation.class))) {
+                    if (!isAssertionInvocation(call) && !"getMessage".equals(call.getExecutable().getSimpleName())) {
+                        
+                        // 1. 원본 호출문을 정보 유실 없이 복제합니다.
+                        CtInvocation<?> preservedCall = call.clone();
+        
+                        // [핵심 해결 로직] 2. 복제된 호출문에 타입 캐스트 정보가 있는지 확인합니다.
+                        if (!preservedCall.getTypeCasts().isEmpty()) {
+                            // 3. 타입 캐스트가 있다면, 빈 리스트를 설정하여 제거합니다.
+                            preservedCall.setTypeCasts(Collections.emptyList());
+                        }
+                        
+                        extractedInvocations.add(preservedCall);
+                    }
+                }
+            }
+            return extractedInvocations;
+        }
+
+        // 2. try-catch 블록 처리: try 블록의 본문만 남김
+        if (statement instanceof CtTry) {
+            CtTry ctTry = (CtTry) statement;
+            if (ctTry.getBody() != null) {
+                return processStatementList(ctTry.getBody().getStatements());
+            }
+            return Collections.emptyList();
+        }
+
+        // (이하 for, if 등 다른 구문 처리 로직은 기존과 동일하게 유지)
+
+        // 3. CtBlock({..})이면, 그 안의 구문 리스트를 재귀적으로 다시 처리합니다.
+        if (statement instanceof CtBlock) {
+            return processStatementList(((CtBlock<?>) statement).getStatements());
+        }
+
+        // 4. for, if, while 등 제어문 내부 재귀 처리
+        CtStatement clonedStatement = statement.clone();
+        if (clonedStatement instanceof CtLoop) {
+            CtLoop loop = (CtLoop) clonedStatement;
+            if (loop.getBody() instanceof CtBlock) {
+                CtBlock<?> bodyBlock = (CtBlock<?>) loop.getBody();
+                bodyBlock.setStatements(processStatementList(bodyBlock.getStatements()));
+            } else if (loop.getBody() != null) {
+                List<CtStatement> newBodyStmts = processStatementList(Collections.singletonList(loop.getBody()));
+                if (!newBodyStmts.isEmpty()) {
+                    loop.setBody(statement.getFactory().createBlock().setStatements(newBodyStmts));
+                } else {
+                    loop.setBody(null);
+                }
+            }
+        } else if (clonedStatement instanceof CtIf) {
+            CtIf ctIf = (CtIf) clonedStatement;
+            if (ctIf.getThenStatement() != null) {
+                List<CtStatement> newThenStmts = processStatementList(
+                        Collections.singletonList(ctIf.getThenStatement()));
+                if (!newThenStmts.isEmpty()) {
+                    ctIf.setThenStatement(statement.getFactory().createBlock().setStatements(newThenStmts));
+                } else {
+                    ctIf.setThenStatement(null);
+                }
+            }
+            if (ctIf.getElseStatement() != null) {
+                List<CtStatement> newElseStmts = processStatementList(
+                        Collections.singletonList(ctIf.getElseStatement()));
+                if (!newElseStmts.isEmpty()) {
+                    ctIf.setElseStatement(statement.getFactory().createBlock().setStatements(newElseStmts));
+                } else {
+                    ctIf.setElseStatement(null);
+                }
+            }
+            if (ctIf.getThenStatement() == null && ctIf.getElseStatement() == null) {
+                return Collections.emptyList();
+            }
+        }
+
+        // 5. 익명 클래스 내부 처리
+        for (CtMethod<?> nestedMethod : clonedStatement.getElements(new TypeFilter<>(CtMethod.class))) {
+            removeTryCatchAndAssertion(nestedMethod);
+        }
+
+        // 6. 그 외 모든 구문은 그대로 반환
+        return Collections.singletonList(clonedStatement);
+    }
+
+    private static boolean isAssertionInvocation(CtInvocation<?> invocation) {
+
+        CtExecutableReference<?> executable = invocation.getExecutable();
+        if (executable == null) {
+
+            return false;
+        }
+
+        String methodName = executable.getSimpleName().toLowerCase();
+
+        if (!methodName.startsWith("assert") && !methodName.equals("fail")) {
+            return false;
+        }
+
+        CtExpression<?> target = invocation.getTarget();
+        if (target != null) {
+            String targetString = target.toString().toLowerCase();
+            if (targetString.contains("junit") || targetString.contains("assert")) {
+                return true;
+            }
+        } else {
+
+        }
+
+        CtTypeReference<?> declaringType = executable.getDeclaringType();
+        if (declaringType != null) {
+            String qualifiedName = declaringType.getQualifiedName();
+
+            if (qualifiedName != null) {
+                String qnLower = qualifiedName.toLowerCase();
+                if (qnLower.contains("junit") || qnLower.contains("assert")) {
+
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+}

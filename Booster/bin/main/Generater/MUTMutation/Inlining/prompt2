@@ -1,0 +1,678 @@
+너는 코딩 전문가가 되어서 내가 코드를 작성하는데 도움을 줄꺼야.
+이미 어느정도 코드가 작성되어 있는데 올바르게 구현되어 있는지 확인해보고 부족한 점이 어떤건지 검토해줘
+
+목표: 주어진 테스트 클래스안에 존재하는 Helper Method (HM)을 찾아서 Leaf HM까지 테스트 메소드에 호출부에다 InLining 을 하는거야
+
+example
+
+테스트 메소드:
+public class IntegrationTest extends IntegrationTestCase {
+public void testConstructorCycle() {
+    CompilerOptions options = createCompilerOptions();
+    options.checkTypes = true;
+    test(options,
+        "/** @return {function()} */ var AsyncTestCase = function() {};\n" +
+        "/**\n" +
+        " * @constructor\n" +
+        " */ Foo = /** @type {function(new:Foo)} */ (AyncTestCase());",
+        RhinoErrorReporter.PARSE_ERROR);
+  }
+
+
+Helper Method :
+
+ @Override
+  protected CompilerOptions createCompilerOptions() {
+    CompilerOptions options = new CompilerOptions();
+    options.setCodingConvention(new GoogleCodingConvention());
+    return options;
+  }
+
+abstract class IntegrationTestCase extends TestCase {
+
+  protected void test(CompilerOptions options,
+      String original, DiagnosticType warning) {
+    test(options, new String[] { original }, warning);
+  }
+
+  protected void test(CompilerOptions options,
+      String[] original, DiagnosticType warning) {
+    test(options, original, null, warning);
+  }
+
+  protected void test(CompilerOptions options,
+      String[] original, String[] compiled, DiagnosticType warning) {
+    Compiler compiler = compile(options, original);
+    checkUnexpectedErrorsOrWarnings(compiler, 1);
+    assertEquals("Expected exactly one warning or error",
+        1, compiler.getErrors().length + compiler.getWarnings().length);
+    if (compiler.getErrors().length > 0) {
+      assertEquals(warning, compiler.getErrors()[0].getType());
+    } else {
+      assertEquals(warning, compiler.getWarnings()[0].getType());
+    }
+
+    if (compiled != null) {
+      Node root = compiler.getRoot().getLastChild();
+      Node expectedRoot = parse(compiled, options, normalizeResults);
+      String explanation = expectedRoot.checkTreeEquals(root);
+      assertNull("\nExpected: " + compiler.toSource(expectedRoot) +
+          "\nResult: " + compiler.toSource(root) +
+          "\n" + explanation, explanation);
+    }
+  }
+
+   protected void test(CompilerOptions options,
+      String[] original, String[] compiled, DiagnosticType[] warnings) {
+    Compiler compiler = compile(options, original);
+    checkUnexpectedErrorsOrWarnings(compiler, warnings.length);
+
+    if (compiled != null) {
+      Node root = compiler.getRoot().getLastChild();
+      Node expectedRoot = parse(compiled, options, normalizeResults);
+      String explanation = expectedRoot.checkTreeEquals(root);
+      assertNull("\nExpected: " + compiler.toSource(expectedRoot) +
+          "\nResult: " + compiler.toSource(root) +
+          "\n" + explanation, explanation);
+    }
+  }
+
+  protected Compiler compile(CompilerOptions options, String original) {
+    return compile(options, new String[] { original });
+  }
+
+  protected Compiler compile(CompilerOptions options, String[] original) {
+    Compiler compiler = lastCompiler = new Compiler();
+    List<SourceFile> inputs = Lists.newArrayList();
+    for (int i = 0; i < original.length; i++) {
+      inputs.add(SourceFile.fromCode("input" + i, original[i]));
+    }
+    compiler.compileModules(
+        externs, Lists.newArrayList(CompilerTestCase.createModuleChain(original)),
+        options);
+    return compiler;
+  }
+
+   static JSModule[] createModuleChain(String... inputs) {
+    JSModule[] modules = createModules(inputs);
+    for (int i = 1; i < modules.length; i++) {
+      modules[i].addDependency(modules[i - 1]);
+    }
+    return modules;
+  }
+
+   protected void checkUnexpectedErrorsOrWarnings(
+      Compiler compiler, int expected) {
+    int actual = compiler.getErrors().length + compiler.getWarnings().length;
+    if (actual != expected) {
+      String msg = "";
+      for (JSError err : compiler.getErrors()) {
+        msg += "Error:" + err.toString() + "\n";
+      }
+      for (JSError err : compiler.getWarnings()) {
+        msg += "Warning:" + err.toString() + "\n";
+      }
+      assertEquals("Unexpected warnings or errors.\n " + msg,
+        expected, actual);
+    }
+  }
+
+    protected Node parse(
+      String[] original, CompilerOptions options, boolean normalize) {
+    Compiler compiler = new Compiler();
+    List<SourceFile> inputs = Lists.newArrayList();
+    for (int i = 0; i < original.length; i++) {
+      inputs.add(SourceFile.fromCode("input" + i, original[i]));
+    }
+    compiler.init(externs, inputs, options);
+    checkUnexpectedErrorsOrWarnings(compiler, 0);
+    Node all = compiler.parseInputs();
+    checkUnexpectedErrorsOrWarnings(compiler, 0);
+    Node n = all.getLastChild();
+    Node externs = all.getFirstChild();
+
+    (new CreateSyntheticBlocks(
+        compiler, "synStart", "synEnd")).process(externs, n);
+
+    if (normalize) {
+      compiler.normalize();
+    }
+
+    return n;
+  }
+
+
+  Inline된 결과물 :
+
+  public void testConstructorCycle() {
+    CompilerOptions options = new CompilerOptions();
+    options.setCodingConvention(new GoogleCodingConvention());
+    CompilerOptions InlinedObj = options;
+    InlinedObj.checkTypes = true;
+
+    Compiler compiler = compile(InlinedObj, "/** @return {function()} */ var AsyncTestCase = function() {};\n" +
+        "/**\n" +
+        " * @constructor\n" +
+        " */ Foo = /** @type {function(new:Foo)} */ (AyncTestCase());");
+
+
+    Compiler compiler = lastCompiler = new Compiler();
+    List<SourceFile> inputs = Lists.newArrayList();
+    for (int i = 0; i < original.length; i++) {
+      inputs.add(SourceFile.fromCode("input" + i, original[i]));
+    }
+    compiler.compileModules(
+        externs, Lists.newArrayList(CompilerTestCase.createModuleChain(original)),
+        options);
+    
+    checkUnexpectedErrorsOrWarnings(compiler, 1);
+    assertEquals("Expected exactly one warning or error",
+        1, compiler.getErrors().length + compiler.getWarnings().length);
+    if (compiler.getErrors().length > 0) {
+      assertEquals(RhinoErrorReporter.PARSE_ERROR, compiler.getErrors()[0].getType());
+    } else {
+      assertEquals(RhinoErrorReporter.PARSE_ERROR, compiler.getWarnings()[0].getType());
+    }
+
+    if (compiled != null) {
+      Node root = compiler.getRoot().getLastChild();
+      Node expectedRoot = parse(compiled, InlinedObj, normalizeResults);
+      String explanation = expectedRoot.checkTreeEquals(root);
+      assertNull("\nExpected: " + compiler.toSource(expectedRoot) +
+          "\nResult: " + compiler.toSource(root) +
+          "\n" + explanation, explanation);
+    }
+  }
+
+
+
+  public void testConstructorCycle() {
+
+        com.google.javascript.jscomp.CompilerOptions options = new com.google.javascript.jscomp.CompilerOptions();
+
+        options.setCodingConvention(new com.google.javascript.jscomp.GoogleCodingConvention());
+
+        options.checkTypes = true;
+
+        com.google.javascript.jscomp.Compiler compiler_inlined_1508 = lastCompiler = new com.google.javascript.jscomp.Compiler();
+
+        java.util.List<com.google.javascript.jscomp.SourceFile> inputs_inlined_2051 = com.google.common.collect.Lists.newArrayList();
+
+        for (int i_inlined_3715 = 0; i_inlined_3715 < new java.lang.String[]{ "/** @return {function()} */ var AsyncTestCase = function() {};\n" + (("/**\n" + " * @constructor\n") + " */ Foo = /** @type {function(new:Foo)} */ (AyncTestCase());") }.length; i_inlined_3715++) {
+
+            inputs_inlined_2051.add(com.google.javascript.jscomp.SourceFile.fromCode("input" + i_inlined_3715, new java.lang.String[]{ "/** @return {function()} */ var AsyncTestCase = function() {};\n" + (("/**\n" + " * @constructor\n") + " */ Foo = /** @type {function(new:Foo)} */ (AyncTestCase());") }[i_inlined_3715]));
+
+        }
+
+        compiler_inlined_1508.compileModules(externs_inlined_2479, com.google.common.collect.Lists.newArrayList(modules_inlined_6576), options);
+
+        int actual_inlined_9194 = compiler_inlined_1508.getErrors().length + compiler_inlined_1508.getWarnings().length;
+
+        if (actual_inlined_9194 != 1) {
+
+            java.lang.String msg_inlined_4931 = "";
+
+            for (com.google.javascript.jscomp.JSError err_inlined_6364 : compiler_inlined_1508.getErrors()) {
+
+                msg_inlined_4931 += ("Error:" + err_inlined_6364.toString()) + "\n";
+
+            }
+
+            for (com.google.javascript.jscomp.JSError err_inlined_6364 : compiler_inlined_1508.getWarnings()) {
+
+                msg_inlined_4931 += ("Warning:" + err_inlined_6364.toString()) + "\n";
+
+            }
+
+            junit.framework.Assert.assertEquals("Unexpected warnings or errors.\n " + msg_inlined_4931, 1, actual_inlined_9194);
+
+        }
+
+        junit.framework.Assert.assertEquals("Expected exactly one warning or error", 1, compiler_inlined_1508.getErrors().length + compiler_inlined_1508.getWarnings().length);
+
+        if (compiler_inlined_1508.getErrors().length > 0) {
+
+            junit.framework.Assert.assertEquals(com.google.javascript.jscomp.RhinoErrorReporter.PARSE_ERROR, compiler_inlined_1508.getErrors()[0].getType());
+
+        } else {
+
+            junit.framework.Assert.assertEquals(com.google.javascript.jscomp.RhinoErrorReporter.PARSE_ERROR, compiler_inlined_1508.getWarnings()[0].getType());
+
+        }
+
+        if (null != null) {
+
+            com.google.javascript.rhino.Node root_inlined_5988 = compiler_inlined_1508.getRoot().getLastChild();
+
+            com.google.javascript.jscomp.Compiler compiler_inlined_1508 = new com.google.javascript.jscomp.Compiler();
+
+            java.util.List<com.google.javascript.jscomp.SourceFile> inputs_inlined_2051 = com.google.common.collect.Lists.newArrayList();
+
+            for (int i_inlined_3715 = 0; i_inlined_3715 < null.length; i_inlined_3715++) {
+
+                inputs_inlined_2051.add(com.google.javascript.jscomp.SourceFile.fromCode("input" + i_inlined_3715, null[i_inlined_3715]));
+
+            }
+
+            compiler_inlined_1508.init(externs_inlined_2479, inputs_inlined_2051, options);
+
+            int actual_inlined_6098 = compiler_inlined_1508.getErrors().length + compiler_inlined_1508.getWarnings().length;
+
+            if (actual_inlined_6098 != 0) {
+
+                java.lang.String msg_inlined_2395 = "";
+
+                for (com.google.javascript.jscomp.JSError err_inlined_3787 : compiler_inlined_1508.getErrors()) {
+
+                    msg_inlined_2395 += ("Error:" + err_inlined_3787.toString()) + "\n";
+
+                }
+
+                for (com.google.javascript.jscomp.JSError err_inlined_3787 : compiler_inlined_1508.getWarnings()) {
+
+                    msg_inlined_2395 += ("Warning:" + err_inlined_3787.toString()) + "\n";
+
+                }
+
+                junit.framework.Assert.assertEquals("Unexpected warnings or errors.\n " + msg_inlined_2395, 0, actual_inlined_6098);
+
+            }
+
+            com.google.javascript.rhino.Node all_inlined_9279 = compiler_inlined_1508.parseInputs();
+
+            int actual_inlined_2804 = compiler_inlined_1508.getErrors().length + compiler_inlined_1508.getWarnings().length;
+
+            if (actual_inlined_2804 != 0) {
+
+                java.lang.String msg_inlined_8693 = "";
+
+                for (com.google.javascript.jscomp.JSError err_inlined_156 : compiler_inlined_1508.getErrors()) {
+
+                    msg_inlined_8693 += ("Error:" + err_inlined_156.toString()) + "\n";
+
+                }
+
+                for (com.google.javascript.jscomp.JSError err_inlined_156 : compiler_inlined_1508.getWarnings()) {
+
+                    msg_inlined_8693 += ("Warning:" + err_inlined_156.toString()) + "\n";
+
+                }
+
+                junit.framework.Assert.assertEquals("Unexpected warnings or errors.\n " + msg_inlined_8693, 0, actual_inlined_2804);
+
+            }
+
+            com.google.javascript.rhino.Node expectedRoot_inlined_1401 = all_inlined_9279.getLastChild();
+
+            com.google.javascript.rhino.Node externs_inlined_2479 = all_inlined_9279.getFirstChild();
+
+            new com.google.javascript.jscomp.CreateSyntheticBlocks(compiler_inlined_1508, "synStart", "synEnd").process(externs_inlined_2479, expectedRoot_inlined_1401);
+
+            if (normalizeResults) {
+
+                compiler_inlined_1508.normalize();
+
+            }
+
+            java.lang.String explanation_inlined_3674 = expectedRoot_inlined_1401.checkTreeEquals(root_inlined_5988);
+
+            junit.framework.Assert.assertNull((((("\nExpected: " + compiler_inlined_1508.toSource(expectedRoot_inlined_1401)) + "\nResult: ") + compiler_inlined_1508.toSource(root_inlined_5988)) + "\n") + explanation_inlined_3674, explanation_inlined_3674);
+
+        }
+
+    }
+
+
+
+
+
+inling의 결과물인데 가독성이 너무 떨어지는것 같지않아
+
+
+
+
+지금 우선 우리가 해결해야 할 문제는 다음과 같은 경우야:
+
+아래 변형된 코드와 로그를 보면 알 수 있듯이 helper 안에 helper를 호출하는 구조가 있어.
+이런 경우에 어떻게 처리해야 할지 고민해봐야 해.
+
+원본 테스트 메소드:
+public void testFunctionDeclarationsInModule() {
+  test(createModules("a; function f(){} function g(){}"),
+       new String[] { "function f(){} function g(){} a" });
+}
+
+변형된 테스트 메소드:
+public void testFunctionDeclarationsInModule_MoveFunctionDeclarationsTest() {
+  com.google.javascript.jscomp.Compiler compiler_inlined_7158 = new com.google.javascript.jscomp.Compiler();
+  lastCompiler = compiler_inlined_7158;
+  compiler_inlined_7158.initModules(externsInputs);
+  test(compiler_inlined_7158, new java.lang.String[]{ "function f(){} function g(){} a" }, null, null);
+}
+
+로그:
+Round 2 | Processing (27/3000): testFunctionDeclarationsInModule() from MoveFunctionDeclarationsTest.java
+Finding next helper to inline in method: testFunctionDeclarationsInModule()
+  -> Inlining call to [test(com.google.javascript.jscomp.JSModule[],java.lang.String[])] in method [testFunctionDeclarationsInModule]
+
+[DEBUG] Inlining attempt on: test(com.google.javascript.jscomp.CompilerTestCase.createModules("a; function f(){} function g(){}"), new java.lang.String[]{ "function f(){} function g(){} a" })
+Finding next helper to inline in method: testFunctionDeclarationsInModule()
+  -> Inlining call to [test(com.google.javascript.jscomp.JSModule[],java.lang.String[],com.google.javascript.jscomp.DiagnosticType)] in method [testFunctionDeclarationsInModule]
+
+[DEBUG] Inlining attempt on: test(com.google.javascript.jscomp.CompilerTestCase.createModules("a; function f(){} function g(){}"), new java.lang.String[]{ "function f(){} function g(){} a" }, null)
+Finding next helper to inline in method: testFunctionDeclarationsInModule()
+  -> Inlining call to [test(com.google.javascript.jscomp.JSModule[],java.lang.String[],com.google.javascript.jscomp.DiagnosticType,com.google.javascript.jscomp.DiagnosticType)] in method [testFunctionDeclarationsInModule]
+
+[DEBUG] Inlining attempt on: test(com.google.javascript.jscomp.CompilerTestCase.createModules("a; function f(){} function g(){}"), new java.lang.String[]{ "function f(){} function g(){} a" }, null, null)
+Finding next helper to inline in method: testFunctionDeclarationsInModule()
+  -> Inlining call to [createCompiler()] in method [testFunctionDeclarationsInModule]
+
+[DEBUG] Inlining attempt on: createCompiler()
+Finding next helper to inline in method: testFunctionDeclarationsInModule()
+  -> Inlining call to [createModules(java.lang.String[])] in method [testFunctionDeclarationsInModule]
+
+[DEBUG] Inlining attempt on: com.google.javascript.jscomp.CompilerTestCase.createModules("a; function f(){} function g(){}")
+[DEBUG] -> FAILURE: AST manipulation for block-wrapping failed. Error: spoon.support.reflect.code.CtBlockImpl cannot be cast to spoon.reflect.code.CtExpression
+FATAL: Inlining did not modify the code for [createModules(java.lang.String[])]. Halting to prevent loop.
+
+
+Helper Method:
+
+static JSModule[] createModules(String... inputs) {
+  JSModule[] modules = new JSModule[inputs.length];
+  for (int i = 0; i < inputs.length; i++) {
+    JSModule module = modules[i] = new JSModule("m" + i);
+    module.add(SourceFile.fromCode("i" + i, inputs[i]));
+  }
+  return modules;
+}
+
+  /**
+   * Verifies that the compiler pass's JS output matches the expected output.
+   *
+   * @param modules Module inputs
+   * @param expected Expected JS outputs (one per module)
+   */
+  public void test(JSModule[] modules, String[] expected) {
+    test(modules, expected, null);
+  }
+
+  /**
+   * Verifies that the compiler pass's JS output matches the expected output,
+   * or that an expected error is encountered.
+   *
+   * @param modules Module inputs
+   * @param expected Expected JS outputs (one per module)
+   * @param error Expected error, or null if no error is expected
+   */
+  public void test(JSModule[] modules, String[] expected,
+      DiagnosticType error) {
+    test(modules, expected, error, null);
+  }
+
+  public void test(JSModule[] modules, String[] expected,
+                   DiagnosticType error, DiagnosticType warning) {
+    Compiler compiler = createCompiler();
+    lastCompiler = compiler;
+
+    compiler.initModules(
+        externsInputs, Lists.newArrayList(modules), getOptions());
+    test(compiler, expected, error, warning);
+  }
+
+
+  protected void test(Compiler compiler, String[] expected,
+                      DiagnosticType error, DiagnosticType warning) {
+    test(compiler, expected, error, warning, null);
+  }
+
+
+  /**
+   * Verifies that the compiler pass's JS output matches the expected output
+   * and (optionally) that an expected warning is issued. Or, if an error is
+   * expected, this method just verifies that the error is encountered.
+   *
+   * @param compiler A compiler that has been initialized via
+   *     {@link Compiler#init}
+   * @param expected Expected output, or null if an error is expected
+   * @param error Expected error, or null if no error is expected
+   * @param warning Expected warning, or null if no warning is expected
+   * @param description The description of the expected warning,
+   *      or null if no warning is expected or if the warning's description
+   *      should not be examined
+   */
+  private void test(Compiler compiler, String[] expected,
+                    DiagnosticType error, DiagnosticType warning,
+                    String description) {
+    RecentChange recentChange = new RecentChange();
+    compiler.addChangeHandler(recentChange);
+
+    Node root = compiler.parseInputs();
+    assertTrue("Unexpected parse error(s): " +
+        Joiner.on("\n").join(compiler.getErrors()), root != null);
+
+    if (astValidationEnabled) {
+      (new AstValidator()).validateRoot(root);
+    }
+    Node externsRoot = root.getFirstChild();
+    Node mainRoot = root.getLastChild();
+
+    // Save the tree for later comparison.
+    Node rootClone = root.cloneTree();
+    Node externsRootClone = rootClone.getFirstChild();
+    Node mainRootClone = rootClone.getLastChild();
+
+    int numRepetitions = getNumRepetitions();
+    ErrorManager[] errorManagers = new ErrorManager[numRepetitions];
+    int aggregateWarningCount = 0;
+    List<JSError> aggregateWarnings = Lists.newArrayList();
+    boolean hasCodeChanged = false;
+
+    assertFalse("Code should not change before processing",
+        recentChange.hasCodeChanged());
+
+    for (int i = 0; i < numRepetitions; ++i) {
+      if (compiler.getErrorCount() == 0) {
+        errorManagers[i] = new BlackHoleErrorManager(compiler);
+
+        // Only run process closure primitives once, if asked.
+        if (closurePassEnabled && i == 0) {
+          recentChange.reset();
+          new ProcessClosurePrimitives(compiler, null, CheckLevel.ERROR)
+              .process(null, mainRoot);
+          hasCodeChanged = hasCodeChanged || recentChange.hasCodeChanged();
+        }
+
+        // Only run the type checking pass once, if asked.
+        // Running it twice can cause unpredictable behavior because duplicate
+        // objects for the same type are created, and the type system
+        // uses reference equality to compare many types.
+        if (typeCheckEnabled && i == 0) {
+          TypeCheck check = createTypeCheck(compiler, typeCheckLevel);
+          check.processForTesting(externsRoot, mainRoot);
+        }
+
+        // Only run the normalize pass once, if asked.
+        if (normalizeEnabled && i == 0) {
+          normalizeActualCode(compiler, externsRoot, mainRoot);
+        }
+
+        if (markNoSideEffects && i == 0) {
+          MarkNoSideEffectCalls mark = new MarkNoSideEffectCalls(compiler);
+          mark.process(externsRoot, mainRoot);
+        }
+
+        recentChange.reset();
+
+        getProcessor(compiler).process(externsRoot, mainRoot);
+        if (astValidationEnabled) {
+          (new AstValidator()).validateRoot(root);
+        }
+        if (checkLineNumbers) {
+          (new LineNumberCheck(compiler)).process(externsRoot, mainRoot);
+        }
+
+        hasCodeChanged = hasCodeChanged || recentChange.hasCodeChanged();
+        aggregateWarningCount += errorManagers[i].getWarningCount();
+        aggregateWarnings.addAll(Lists.newArrayList(compiler.getWarnings()));
+
+        if (normalizeEnabled) {
+          boolean verifyDeclaredConstants = true;
+          new Normalize.VerifyConstants(compiler, verifyDeclaredConstants)
+              .process(externsRoot, mainRoot);
+        }
+      }
+    }
+
+    if (error == null) {
+      assertEquals(
+          "Unexpected error(s): " + Joiner.on("\n").join(compiler.getErrors()),
+          0, compiler.getErrorCount());
+
+      // Verify the symbol table.
+      ErrorManager symbolTableErrorManager =
+          new BlackHoleErrorManager(compiler);
+      Node expectedRoot = null;
+      if (expected != null) {
+        expectedRoot = parseExpectedJs(expected);
+        expectedRoot.detachFromParent();
+      }
+
+      JSError[] stErrors = symbolTableErrorManager.getErrors();
+      if (expectedSymbolTableError != null) {
+        assertEquals("There should be one error.", 1, stErrors.length);
+        assertEquals(expectedSymbolTableError, stErrors[0].getType());
+      } else {
+        assertEquals("Unexpected symbol table error(s): " +
+            Joiner.on("\n").join(stErrors),
+            0, stErrors.length);
+      }
+
+      if (warning == null) {
+        assertEquals(
+            "Unexpected warning(s): " + Joiner.on("\n").join(aggregateWarnings),
+            0, aggregateWarningCount);
+      } else {
+        assertEquals("There should be one warning, repeated " + numRepetitions +
+            " time(s).", numRepetitions, aggregateWarningCount);
+        for (int i = 0; i < numRepetitions; ++i) {
+          JSError[] warnings = errorManagers[i].getWarnings();
+          JSError actual = warnings[0];
+          assertEquals(warning, actual.getType());
+
+          // Make sure that source information is always provided.
+          if (!allowSourcelessWarnings) {
+            assertTrue("Missing source file name in warning",
+                actual.sourceName != null && !actual.sourceName.isEmpty());
+            assertTrue("Missing line number in warning",
+                -1 != actual.lineNumber);
+            assertTrue("Missing char number in warning",
+                -1 != actual.getCharno());
+          }
+
+          if (description != null) {
+            assertEquals(description, actual.description);
+          }
+        }
+      }
+
+      if (normalizeEnabled) {
+        normalizeActualCode(compiler, externsRootClone, mainRootClone);
+      }
+
+      boolean codeChange = !mainRootClone.isEquivalentTo(mainRoot);
+      boolean externsChange = !externsRootClone.isEquivalentTo(externsRoot);
+
+      // Generally, externs should not be change by the compiler passes.
+      if (externsChange && !allowExternsChanges) {
+        String explanation = externsRootClone.checkTreeEquals(externsRoot);
+        fail("Unexpected changes to externs" +
+            "\nExpected: " + compiler.toSource(externsRootClone) +
+            "\nResult: " + compiler.toSource(externsRoot) +
+            "\n" + explanation);
+      }
+
+      if (!codeChange && !externsChange) {
+        assertFalse(
+            "compiler.reportCodeChange() was called " +
+            "even though nothing changed",
+            hasCodeChanged);
+      } else {
+        assertTrue("compiler.reportCodeChange() should have been called",
+            hasCodeChanged);
+      }
+
+      if (expected != null) {
+        if (compareAsTree) {
+          String explanation = expectedRoot.checkTreeEquals(mainRoot);
+          assertNull("\nExpected: " + compiler.toSource(expectedRoot) +
+              "\nResult: " + compiler.toSource(mainRoot) +
+              "\n" + explanation, explanation);
+        } else if (expected != null) {
+          assertEquals(
+              Joiner.on("").join(expected), compiler.toSource(mainRoot));
+        }
+      }
+
+      // Verify normalization is not invalidated.
+      Node normalizeCheckRootClone = root.cloneTree();
+      Node normalizeCheckExternsRootClone = root.getFirstChild();
+      Node normalizeCheckMainRootClone = root.getLastChild();
+      new PrepareAst(compiler).process(
+          normalizeCheckExternsRootClone, normalizeCheckMainRootClone);
+      String explanation =
+          normalizeCheckMainRootClone.checkTreeEquals(mainRoot);
+      assertNull("Node structure normalization invalidated.\nExpected: " +
+          compiler.toSource(normalizeCheckMainRootClone) +
+          "\nResult: " + compiler.toSource(mainRoot) +
+          "\n" + explanation, explanation);
+
+      // TODO(johnlenz): enable this for most test cases.
+      // Currently, this invalidates test for while-loops, for-loop
+      // initializers, and other naming.  However, a set of code
+      // (FoldConstants, etc) runs before the Normalize pass, so this can't be
+      // force on everywhere.
+      if (normalizeEnabled) {
+        new Normalize(compiler, true).process(
+            normalizeCheckExternsRootClone, normalizeCheckMainRootClone);
+        explanation =  normalizeCheckMainRootClone.checkTreeEquals(mainRoot);
+        assertNull("Normalization invalidated.\nExpected: " +
+            compiler.toSource(normalizeCheckMainRootClone) +
+            "\nResult: " + compiler.toSource(mainRoot) +
+            "\n" + explanation, explanation);
+      }
+    } else {
+      String errors = "";
+      for (JSError actualError : compiler.getErrors()) {
+        errors += actualError.description + "\n";
+      }
+      assertEquals("There should be one error. " + errors,
+          1, compiler.getErrorCount());
+      assertEquals(errors, error, compiler.getErrors()[0].getType());
+
+      if (warning != null) {
+        String warnings = "";
+        for (JSError actualError : compiler.getWarnings()) {
+          warnings += actualError.description + "\n";
+        }
+        assertEquals("There should be one warning. " + warnings,
+            1, compiler.getWarningCount());
+        assertEquals(warnings, warning, compiler.getWarnings()[0].getType());
+      }
+    }
+  }
+
+  private static class BlackHoleErrorManager extends BasicErrorManager {
+    private BlackHoleErrorManager(Compiler compiler) {
+      compiler.setErrorManager(this);
+    }
+
+    @Override
+    public void println(CheckLevel level, JSError error) {}
+
+    @Override
+    public void printSummary() {}
+  }
+
+
+

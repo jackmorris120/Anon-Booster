@@ -1,0 +1,412 @@
+너는 코딩 전문가가 되어서 내가 코드를 작성하는데 도움을 줄꺼야.
+이미 어느정도 코드가 작성되어 있는데 올바르게 구현되어 있는지 확인해보고 문제점을 해결하기 위해 코드의 어디를 수정해야할지 알려줘
+
+목표: 주어진 테스트 클래스안에 존재하는 Helper Method (HM)을 찾아서 Leaf HM까지 테스트 메소드에 호출부에다 InLining 을 하는거야
+
+문제점: 
+- Inlining 과정의 return 값을 처리하는 과정에서 유령 변수가 생겼음.
+- 분석 대상인 테스트 메소드는 IntegrationTest에 위치 Helper는 IntegrationTest가 extend 하고 있는 IntegrationTestCase와 Import 해서 사용하고 있는 CompilerTestCase 에 위치
+- 문제가 되는 유령 변수는 다음과 같이 메소드 호출의 parameter를 생성하는데 문제가 생겼음
+
+문제 라인 원본:
+compiler.compileModules(externs, Lists.newArrayList(CompilerTestCase.createModuleChain(original)), options);
+
+문제 라인 변형본:
+compiler_inlined_6102.compileModules(externs, com.google.common.collect.Lists.newArrayList(inlined_var_3889), options);
+
+관련 분석 대상 및 Helpers:
+
+테스트 메소드:
+public class IntegrationTest extends IntegrationTestCase {
+public void testConstructorCycle() {
+    CompilerOptions options = createCompilerOptions();
+    options.checkTypes = true;
+    test(options,
+        "/** @return {function()} */ var AsyncTestCase = function() {};\n" +
+        "/**\n" +
+        " * @constructor\n" +
+        " */ Foo = /** @type {function(new:Foo)} */ (AyncTestCase());",
+        RhinoErrorReporter.PARSE_ERROR);
+  }
+
+
+Helper Method :
+
+ @Override
+  protected CompilerOptions createCompilerOptions() {
+    CompilerOptions options = new CompilerOptions();
+    options.setCodingConvention(new GoogleCodingConvention());
+    return options;
+  }
+
+abstract class IntegrationTestCase extends TestCase {
+
+  protected void test(CompilerOptions options,
+      String original, DiagnosticType warning) {
+    test(options, new String[] { original }, warning);
+  }
+
+  protected void test(CompilerOptions options,
+      String[] original, DiagnosticType warning) {
+    test(options, original, null, warning);
+  }
+
+  protected void test(CompilerOptions options,
+      String[] original, String[] compiled, DiagnosticType warning) {
+    Compiler compiler = compile(options, original);
+    checkUnexpectedErrorsOrWarnings(compiler, 1);
+    assertEquals("Expected exactly one warning or error",
+        1, compiler.getErrors().length + compiler.getWarnings().length);
+    if (compiler.getErrors().length > 0) {
+      assertEquals(warning, compiler.getErrors()[0].getType());
+    } else {
+      assertEquals(warning, compiler.getWarnings()[0].getType());
+    }
+
+    if (compiled != null) {
+      Node root = compiler.getRoot().getLastChild();
+      Node expectedRoot = parse(compiled, options, normalizeResults);
+      String explanation = expectedRoot.checkTreeEquals(root);
+      assertNull("\nExpected: " + compiler.toSource(expectedRoot) +
+          "\nResult: " + compiler.toSource(root) +
+          "\n" + explanation, explanation);
+    }
+  }
+
+   protected void test(CompilerOptions options,
+      String[] original, String[] compiled, DiagnosticType[] warnings) {
+    Compiler compiler = compile(options, original);
+    checkUnexpectedErrorsOrWarnings(compiler, warnings.length);
+
+    if (compiled != null) {
+      Node root = compiler.getRoot().getLastChild();
+      Node expectedRoot = parse(compiled, options, normalizeResults);
+      String explanation = expectedRoot.checkTreeEquals(root);
+      assertNull("\nExpected: " + compiler.toSource(expectedRoot) +
+          "\nResult: " + compiler.toSource(root) +
+          "\n" + explanation, explanation);
+    }
+  }
+
+  protected Compiler compile(CompilerOptions options, String original) {
+    return compile(options, new String[] { original });
+  }
+
+  protected Compiler compile(CompilerOptions options, String[] original) {
+    Compiler compiler = lastCompiler = new Compiler();
+    List<SourceFile> inputs = Lists.newArrayList();
+    for (int i = 0; i < original.length; i++) {
+      inputs.add(SourceFile.fromCode("input" + i, original[i]));
+    }
+    compiler.compileModules(
+        externs, Lists.newArrayList(CompilerTestCase.createModuleChain(original)),
+        options);
+    return compiler;
+  }
+
+   static JSModule[] createModuleChain(String... inputs) {
+    JSModule[] modules = createModules(inputs);
+    for (int i = 1; i < modules.length; i++) {
+      modules[i].addDependency(modules[i - 1]);
+    }
+    return modules;
+  }
+
+   protected void checkUnexpectedErrorsOrWarnings(
+      Compiler compiler, int expected) {
+    int actual = compiler.getErrors().length + compiler.getWarnings().length;
+    if (actual != expected) {
+      String msg = "";
+      for (JSError err : compiler.getErrors()) {
+        msg += "Error:" + err.toString() + "\n";
+      }
+      for (JSError err : compiler.getWarnings()) {
+        msg += "Warning:" + err.toString() + "\n";
+      }
+      assertEquals("Unexpected warnings or errors.\n " + msg,
+        expected, actual);
+    }
+  }
+
+    protected Node parse(
+      String[] original, CompilerOptions options, boolean normalize) {
+    Compiler compiler = new Compiler();
+    List<SourceFile> inputs = Lists.newArrayList();
+    for (int i = 0; i < original.length; i++) {
+      inputs.add(SourceFile.fromCode("input" + i, original[i]));
+    }
+    compiler.init(externs, inputs, options);
+    checkUnexpectedErrorsOrWarnings(compiler, 0);
+    Node all = compiler.parseInputs();
+    checkUnexpectedErrorsOrWarnings(compiler, 0);
+    Node n = all.getLastChild();
+    Node externs = all.getFirstChild();
+
+    (new CreateSyntheticBlocks(
+        compiler, "synStart", "synEnd")).process(externs, n);
+
+    if (normalize) {
+      compiler.normalize();
+    }
+
+    return n;
+  }
+
+
+  Inline된 결과물 :
+
+  public void testConstructorCycle() {
+    CompilerOptions options = new CompilerOptions();
+    options.setCodingConvention(new GoogleCodingConvention());
+    CompilerOptions InlinedObj = options;
+    InlinedObj.checkTypes = true;
+
+    Compiler compiler = compile(InlinedObj, "/** @return {function()} */ var AsyncTestCase = function() {};\n" +
+        "/**\n" +
+        " * @constructor\n" +
+        " */ Foo = /** @type {function(new:Foo)} */ (AyncTestCase());");
+
+
+    Compiler compiler = lastCompiler = new Compiler();
+    List<SourceFile> inputs = Lists.newArrayList();
+    for (int i = 0; i < original.length; i++) {
+      inputs.add(SourceFile.fromCode("input" + i, original[i]));
+    }
+    compiler.compileModules(
+        externs, Lists.newArrayList(CompilerTestCase.createModuleChain(original)),
+        options);
+    
+    checkUnexpectedErrorsOrWarnings(compiler, 1);
+    assertEquals("Expected exactly one warning or error",
+        1, compiler.getErrors().length + compiler.getWarnings().length);
+    if (compiler.getErrors().length > 0) {
+      assertEquals(RhinoErrorReporter.PARSE_ERROR, compiler.getErrors()[0].getType());
+    } else {
+      assertEquals(RhinoErrorReporter.PARSE_ERROR, compiler.getWarnings()[0].getType());
+    }
+
+    if (compiled != null) {
+      Node root = compiler.getRoot().getLastChild();
+      Node expectedRoot = parse(compiled, InlinedObj, normalizeResults);
+      String explanation = expectedRoot.checkTreeEquals(root);
+      assertNull("\nExpected: " + compiler.toSource(expectedRoot) +
+          "\nResult: " + compiler.toSource(root) +
+          "\n" + explanation, explanation);
+    }
+  }
+
+
+
+  public void testConstructorCycle() {
+
+        com.google.javascript.jscomp.CompilerOptions options = new com.google.javascript.jscomp.CompilerOptions();
+
+        options.setCodingConvention(new com.google.javascript.jscomp.GoogleCodingConvention());
+
+        options.checkTypes = true;
+
+        com.google.javascript.jscomp.Compiler compiler_inlined_1508 = lastCompiler = new com.google.javascript.jscomp.Compiler();
+
+        java.util.List<com.google.javascript.jscomp.SourceFile> inputs_inlined_2051 = com.google.common.collect.Lists.newArrayList();
+
+        for (int i_inlined_3715 = 0; i_inlined_3715 < new java.lang.String[]{ "/** @return {function()} */ var AsyncTestCase = function() {};\n" + (("/**\n" + " * @constructor\n") + " */ Foo = /** @type {function(new:Foo)} */ (AyncTestCase());") }.length; i_inlined_3715++) {
+
+            inputs_inlined_2051.add(com.google.javascript.jscomp.SourceFile.fromCode("input" + i_inlined_3715, new java.lang.String[]{ "/** @return {function()} */ var AsyncTestCase = function() {};\n" + (("/**\n" + " * @constructor\n") + " */ Foo = /** @type {function(new:Foo)} */ (AyncTestCase());") }[i_inlined_3715]));
+
+        }
+
+        compiler_inlined_1508.compileModules(externs_inlined_2479, com.google.common.collect.Lists.newArrayList(modules_inlined_6576), options);
+
+        int actual_inlined_9194 = compiler_inlined_1508.getErrors().length + compiler_inlined_1508.getWarnings().length;
+
+        if (actual_inlined_9194 != 1) {
+
+            java.lang.String msg_inlined_4931 = "";
+
+            for (com.google.javascript.jscomp.JSError err_inlined_6364 : compiler_inlined_1508.getErrors()) {
+
+                msg_inlined_4931 += ("Error:" + err_inlined_6364.toString()) + "\n";
+
+            }
+
+            for (com.google.javascript.jscomp.JSError err_inlined_6364 : compiler_inlined_1508.getWarnings()) {
+
+                msg_inlined_4931 += ("Warning:" + err_inlined_6364.toString()) + "\n";
+
+            }
+
+            junit.framework.Assert.assertEquals("Unexpected warnings or errors.\n " + msg_inlined_4931, 1, actual_inlined_9194);
+
+        }
+
+        junit.framework.Assert.assertEquals("Expected exactly one warning or error", 1, compiler_inlined_1508.getErrors().length + compiler_inlined_1508.getWarnings().length);
+
+        if (compiler_inlined_1508.getErrors().length > 0) {
+
+            junit.framework.Assert.assertEquals(com.google.javascript.jscomp.RhinoErrorReporter.PARSE_ERROR, compiler_inlined_1508.getErrors()[0].getType());
+
+        } else {
+
+            junit.framework.Assert.assertEquals(com.google.javascript.jscomp.RhinoErrorReporter.PARSE_ERROR, compiler_inlined_1508.getWarnings()[0].getType());
+
+        }
+
+        if (null != null) {
+
+            com.google.javascript.rhino.Node root_inlined_5988 = compiler_inlined_1508.getRoot().getLastChild();
+
+            com.google.javascript.jscomp.Compiler compiler_inlined_1508 = new com.google.javascript.jscomp.Compiler();
+
+            java.util.List<com.google.javascript.jscomp.SourceFile> inputs_inlined_2051 = com.google.common.collect.Lists.newArrayList();
+
+            for (int i_inlined_3715 = 0; i_inlined_3715 < null.length; i_inlined_3715++) {
+
+                inputs_inlined_2051.add(com.google.javascript.jscomp.SourceFile.fromCode("input" + i_inlined_3715, null[i_inlined_3715]));
+
+            }
+
+            compiler_inlined_1508.init(externs_inlined_2479, inputs_inlined_2051, options);
+
+            int actual_inlined_6098 = compiler_inlined_1508.getErrors().length + compiler_inlined_1508.getWarnings().length;
+
+            if (actual_inlined_6098 != 0) {
+
+                java.lang.String msg_inlined_2395 = "";
+
+                for (com.google.javascript.jscomp.JSError err_inlined_3787 : compiler_inlined_1508.getErrors()) {
+
+                    msg_inlined_2395 += ("Error:" + err_inlined_3787.toString()) + "\n";
+
+                }
+
+                for (com.google.javascript.jscomp.JSError err_inlined_3787 : compiler_inlined_1508.getWarnings()) {
+
+                    msg_inlined_2395 += ("Warning:" + err_inlined_3787.toString()) + "\n";
+
+                }
+
+                junit.framework.Assert.assertEquals("Unexpected warnings or errors.\n " + msg_inlined_2395, 0, actual_inlined_6098);
+
+            }
+
+            com.google.javascript.rhino.Node all_inlined_9279 = compiler_inlined_1508.parseInputs();
+
+            int actual_inlined_2804 = compiler_inlined_1508.getErrors().length + compiler_inlined_1508.getWarnings().length;
+
+            if (actual_inlined_2804 != 0) {
+
+                java.lang.String msg_inlined_8693 = "";
+
+                for (com.google.javascript.jscomp.JSError err_inlined_156 : compiler_inlined_1508.getErrors()) {
+
+                    msg_inlined_8693 += ("Error:" + err_inlined_156.toString()) + "\n";
+
+                }
+
+                for (com.google.javascript.jscomp.JSError err_inlined_156 : compiler_inlined_1508.getWarnings()) {
+
+                    msg_inlined_8693 += ("Warning:" + err_inlined_156.toString()) + "\n";
+
+                }
+
+                junit.framework.Assert.assertEquals("Unexpected warnings or errors.\n " + msg_inlined_8693, 0, actual_inlined_2804);
+
+            }
+
+            com.google.javascript.rhino.Node expectedRoot_inlined_1401 = all_inlined_9279.getLastChild();
+
+            com.google.javascript.rhino.Node externs_inlined_2479 = all_inlined_9279.getFirstChild();
+
+            new com.google.javascript.jscomp.CreateSyntheticBlocks(compiler_inlined_1508, "synStart", "synEnd").process(externs_inlined_2479, expectedRoot_inlined_1401);
+
+            if (normalizeResults) {
+
+                compiler_inlined_1508.normalize();
+
+            }
+
+            java.lang.String explanation_inlined_3674 = expectedRoot_inlined_1401.checkTreeEquals(root_inlined_5988);
+
+            junit.framework.Assert.assertNull((((("\nExpected: " + compiler_inlined_1508.toSource(expectedRoot_inlined_1401)) + "\nResult: ") + compiler_inlined_1508.toSource(root_inlined_5988)) + "\n") + explanation_inlined_3674, explanation_inlined_3674);
+
+        }
+
+    }
+
+
+
+
+
+public void testConstructorCycle() {
+    // --- Inlined from createCompilerOptions() ---
+    CompilerOptions options_inlined_1 = new CompilerOptions();
+    options_inlined_1.setCodingConvention(new GoogleCodingConvention());
+    
+    // Original line from testConstructorCycle
+    options_inlined_1.checkTypes = true;
+
+    // --- Inlined from the 'test' method chain ---
+    // These are the arguments that were passed to the original test() call
+    String[] original_inlined_2 = new String[] {
+        "/** @return {function()} */ var AsyncTestCase = function() {};\n" +
+        "/**\n" +
+        " * @constructor\n" +
+        " */ Foo = /** @type {function(new:Foo)} */ (AyncTestCase());"
+    };
+    DiagnosticType warning_inlined_2 = RhinoErrorReporter.PARSE_ERROR;
+    String[] compiled_inlined_2 = null;
+
+    // --- Inlined from compile(options, original) ---
+    Compiler compiler_inlined_3 = new Compiler();
+    // Assuming 'lastCompiler' was a field we don't need to assign to here.
+    
+    List<SourceFile> inputs_inlined_4 = Lists.newArrayList();
+    for (int i_inlined_5 = 0; i_inlined_5 < original_inlined_2.length; i_inlined_5++) {
+        inputs_inlined_4.add(SourceFile.fromCode("input" + i_inlined_5, original_inlined_2[i_inlined_5]));
+    }
+    
+    // --- Inlined from createModuleChain(original) ---
+    // Assuming 'createModules' is a static helper that can be called directly.
+    // Also assuming 'externs' is a field available in this scope.
+    JSModule[] modules_inlined_6 = IntegrationTestCase.createModules(original_inlined_2);
+    for (int i_inlined_7 = 1; i_inlined_7 < modules_inlined_6.length; i_inlined_7++) {
+        modules_inlined_6[i_inlined_7].addDependency(modules_inlined_6[i_inlined_7 - 1]);
+    }
+    // End of createModuleChain inlining
+    
+    compiler_inlined_3.compileModules(
+        externs, Lists.newArrayList(modules_inlined_6), options_inlined_1
+    );
+    // End of compile() inlining, the result is 'compiler_inlined_3'
+    
+    // --- Inlined from checkUnexpectedErrorsOrWarnings(compiler, 1) ---
+    int expected_inlined_8 = 1;
+    int actual_inlined_8 = compiler_inlined_3.getErrors().length + compiler_inlined_3.getWarnings().length;
+    if (actual_inlined_8 != expected_inlined_8) {
+        String msg_inlined_9 = "";
+        for (JSError err_inlined_10 : compiler_inlined_3.getErrors()) {
+            msg_inlined_9 += "Error:" + err_inlined_10.toString() + "\n";
+        }
+        for (JSError err_inlined_10 : compiler_inlined_3.getWarnings()) {
+            msg_inlined_9 += "Warning:" + err_inlined_10.toString() + "\n";
+        }
+        assertEquals("Unexpected warnings or errors.\n " + msg_inlined_9,
+            expected_inlined_8, actual_inlined_8);
+    }
+    // End of checkUnexpectedErrorsOrWarnings inlining
+    
+    assertEquals("Expected exactly one warning or error",
+        1, compiler_inlined_3.getErrors().length + compiler_inlined_3.getWarnings().length);
+        
+    if (compiler_inlined_3.getErrors().length > 0) {
+        assertEquals(warning_inlined_2, compiler_inlined_3.getErrors()[0].getType());
+    } else {
+        assertEquals(warning_inlined_2, compiler_inlined_3.getWarnings()[0].getType());
+    }
+
+    // The 'if (compiled != null)' block from the original 'test' method is skipped
+    // because 'compiled_inlined_2' is null.
+}
+
+
+

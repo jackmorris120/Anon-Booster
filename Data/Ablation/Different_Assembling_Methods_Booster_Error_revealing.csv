@@ -1,0 +1,17 @@
+project,SeqP,SeqC,BOTH
+Chart,4,7,0
+Cli,3,2,3
+Closure,28,3,7
+Codec,1,5,0
+Compress,1,2,1
+Csv,0,3,0
+Gson,1,2,1
+JacksonCore,5,3,1
+JacksonDatabind,21,4,0
+Jsoup,3,10,2
+JxPath,0,4,1
+Lang,7,5,2
+Math,12,14,4
+Mockito,14,2,1
+Time,1,4,1
+Total,101,70,24

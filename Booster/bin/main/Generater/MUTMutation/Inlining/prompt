@@ -1,0 +1,53 @@
+너는 코딩 전문가가 되어서 내가 코드를 작성하는데 도움을 줄꺼야.
+이미 어느정도 코드가 작성되어 있는데 올바르게 구현되어 있는지 확인해보고 문제점을 해결하기 위해 코드의 어디를 수정해야할지 알려줘.
+내가 구현한 코드는 개발자 테스트 클래스에 Helper Method (HM)과 테스트 + Helper에서 호출하는 필요한 필드 값을들 찾아서 Inline 하는 코드를 작성했어.
+우리는 자바 8버전과 스푼 9.1.0 라이브러리를 사용하게 될꺼야 스푼 버전은 더이상 올릴 수가 없어.
+
+문제점: 
+- Inlining 과정에 필요한 Fields 값등의 필요한 변수 및 초기값을 Setup을 통해 가져오려고 시도함.
+- 하지만 그 순서가 잘 맞지 않음
+- 필요한 변수가 Recursive하게 Inline 되어야 하는 경우도 발생
+
+
+아래 예제에 대해서는 필요한 필드값인 localEntry와 그것의 초기화문을 잘 Inline 했지만 
+Inline 과정에서 또 다른 필드 값인 localScope에 대한 선언문을 가져오지 못함
+
+원본코드:
+
+public class TestScaledDurationField extends TestCase {
+    
+    private static final long LONG_INTEGER_MAX = Integer.MAX_VALUE;
+    private static final int INTEGER_MAX = Integer.MAX_VALUE;
+    private static final long LONG_MAX = Long.MAX_VALUE;
+    
+    private ScaledDurationField iField;
+
+    protected void setUp() throws Exception {
+        DurationField base = MillisDurationField.INSTANCE;
+        iField = new ScaledDurationField(base, DurationFieldType.minutes(), 90);
+    }
+
+public void test_getScalar() {
+        assertEquals(90, iField.getScalar());
+    }
+
+
+
+변형코드:
+public void test_getScalar_TestScaledDurationField() {
+        org.joda.time.field.ScaledDurationField iField = new org.joda.time.field.ScaledDurationField(base, org.joda.time.DurationFieldType.minutes(), 90);
+        iField.getScalar();
+    }
+
+
+목표하는 코드:
+
+public void test_getScalar_TestScaledDurationField() {
+        DurationField base = MillisDurationField.INSTANCE; // Inline 된 라인 2
+        org.joda.time.field.ScaledDurationField iField = new org.joda.time.field.ScaledDurationField(base, org.joda.time.DurationFieldType.minutes(), 90); // Inline 된 라인 1
+        iField.getScalar();
+    }
+
+
+
+

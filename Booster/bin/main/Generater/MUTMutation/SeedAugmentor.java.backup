@@ -1,0 +1,3963 @@
+package Generater.MUTMutation;
+
+import spoon.Launcher;
+import spoon.reflect.reference.CtVariableReference;
+import spoon.reflect.visitor.filter.TypeFilter;
+import spoon.reflect.code.*;
+import spoon.reflect.declaration.*;
+import spoon.reflect.factory.Factory;
+import spoon.reflect.reference.CtTypeReference;
+import spoon.reflect.reference.CtExecutableReference;
+import spoon.reflect.reference.CtArrayTypeReference;
+import java.util.concurrent.TimeoutException;
+
+import spoon.support.reflect.code.*;
+import utils.Config;
+import utils.Pair;
+
+import javax.tools.*;
+import java.io.*;
+import java.lang.reflect.Field;
+import java.util.Comparator;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.net.URI;
+import java.net.URLClassLoader;
+import java.util.*;
+import java.lang.reflect.Constructor;
+import java.util.stream.Collectors;
+import Generater.MUTMutation.InputCombinations;
+
+public class SeedAugmentor {
+
+    private static List<String> neglectedMUTs;
+    private static HashMap<CtTypeReference, Set<CtConstructor<?>>> generatedConstructors = new HashMap<>();
+    private static HashMap<Pair<CtTypeReference, CtElement>, Set<List<CtElement>>> baseVartypeToInputPool;
+    private static HashMap<CtTypeReference, List<Pair<CtTypeReference, CtElement>>> baseVarTypeNamePoolAsList;
+    private static HashMap<CtTypeReference<?>, List<CtElement>> baseDirectToValuesAsList;
+    private static Map<String, CtConstructor<?>> abstractConstructorCache = new HashMap<>();
+    private static boolean recursiveMethodCalls = Config.recursiveMethodCalls;
+    private static int dummyVarCounter = 0;
+    private static boolean usedInputPool = false;
+    private static final Random rand = new Random();
+    private static Factory factory;
+    private static Map<CtTypeReference<?>, List<CtStatement>> creationSequenceCache = new HashMap<>();
+    
+    // Debug switches for various logging
+    private static final boolean DEBUG_STRING_MUTATION = false;
+    private static final boolean DEBUG_POOL_AUGMENTATION = true;
+    private static final boolean DEBUG_MUT_ANALYSIS = true;
+    private static final boolean DEBUG_OBJECT_GENERATION = true;
+    private static final boolean DEBUG_POOL_MONITORING = true;
+
+    // Performance optimization caches
+    private static Map<String, List<CtMethod<?>>> factoryMethodCache = new HashMap<>();
+    private static Map<String, List<CtMethod<?>>> allMethodCache = new HashMap<>();
+    private static Set<String> factoryMethodNames = new HashSet<>(Arrays.asList(
+            "getInstance", "newInstance", "create", "createInstance",
+            "valueOf", "of", "from", "parse", "build", "get"));
+    private static Map<String, Boolean> typeCompatibilityCache = new HashMap<>();
+
+    // Track which types have already had variants generated
+    private static Set<String> variantsGeneratedTypes = new HashSet<>();
+    
+    // MUT-based pool analysis cache
+    private static Map<CtTypeReference<?>, Integer> typePoolSizeCache = new HashMap<>();
+    private static Set<CtTypeReference<?>> typesNeedingAugmentation = new HashSet<>();
+    private static final int MIN_POOL_SIZE_THRESHOLD = 5;  // Pool size should be > this value
+    private static final int SAFE_POOL_SIZE = MIN_POOL_SIZE_THRESHOLD + 1;  // Target for generation
+    
+    // Debugging statistics
+    private static Map<String, Integer> generationAttemptStats = new HashMap<>();
+    private static Map<String, Integer> generationSuccessStats = new HashMap<>();
+    private static long totalGenerationTime = 0;
+    private static int totalPoolAugmentationCalls = 0;
+
+    /**
+     * ENTRY POINT
+     */
+
+    public static void augmentInitalSeed() {
+        long newStartTime = System.currentTimeMillis();
+
+        // Clear caches for fresh start
+        clearCaches();
+
+        baseVarTypeNamePoolAsList = new HashMap<>();
+        HashMap<CtTypeReference, Set<Pair<CtTypeReference, CtElement>>> baseVarTypeNamePool = new HashMap<>(
+                CandidatePool.getVarTypeNamePool());
+        baseVarTypeNamePool.forEach((key, value) -> {
+            baseVarTypeNamePoolAsList.put(key, new ArrayList<>(value));
+        });
+        baseVartypeToInputPool = new HashMap<>(CandidatePool.getVartypeToInputPool());
+        baseDirectToValuesAsList = new HashMap<>();
+        HashMap<CtTypeReference, Set<CtElement>> directToValues = CandidatePool.getDirectToValues();
+        directToValues.forEach((key, value) -> {
+            baseDirectToValuesAsList.put(key, new ArrayList<>(value));
+        });
+        // Analyze MUT requirements and identify types needing augmentation
+        analyzeRequiredTypesFromMUTs();
+        
+        neglectedMUTs = findOutNeglectedMUTS();
+        if (neglectedMUTs == null) {
+            return;
+        }
+        if (factory == null) {
+            factory = new Launcher().getFactory();
+        }
+        System.out.println("NeglectedMUTs Size : " + neglectedMUTs.size() + " | # Public API of CUT : "
+                + ASTParser.getCUT_PublicMethodSize());
+        System.out.println("Generating Dummy MUTs for Neglected Public APIs");
+        generateDummyMUTS(neglectedMUTs);
+        
+        // Generate additional objects for types with insufficient pool size
+        generateAdditionalObjectsForInsufficientTypes();
+        long augmentationEndTime = System.currentTimeMillis() - newStartTime;
+        System.out.println("Augmentation Time : " + augmentationEndTime + " ms");
+        System.out.println("Factory Method Cache Size: " + factoryMethodCache.size());
+        System.out.println("All Method Cache Size: " + allMethodCache.size());
+        System.out.println("Type Compatibility Cache Size: " + typeCompatibilityCache.size());
+        
+        // Print final debugging statistics if enabled
+        if (DEBUG_POOL_AUGMENTATION || DEBUG_OBJECT_GENERATION) {
+            System.out.println("\n📈 SEED AUGMENTATION SUMMARY:");
+            System.out.println("============================================");
+            System.out.println("🔍 Types analyzed: " + typePoolSizeCache.size());
+            System.out.println("⚠️  Types needing augmentation: " + typesNeedingAugmentation.size());
+            System.out.println("📦 Pool augmentation calls: " + totalPoolAugmentationCalls);
+            
+            if (totalGenerationTime > 0) {
+                System.out.println("⏱️  Total object generation time: " + totalGenerationTime + " ms");
+                
+                int totalSuccesses = generationSuccessStats.values().stream().mapToInt(Integer::intValue).sum();
+                if (totalSuccesses > 0) {
+                    double avgTime = (double) totalGenerationTime / totalSuccesses;
+                    System.out.println("⏱️  Average time per generated object: " + String.format("%.2f", avgTime) + " ms");
+                }
+            }
+            System.out.println("============================================\n");
+        }
+    }
+
+    /**
+     * Clear all caches to free memory
+     */
+    public static void clearCaches() {
+        factoryMethodCache.clear();
+        allMethodCache.clear();
+        typeCompatibilityCache.clear();
+        creationSequenceCache.clear();
+        abstractConstructorCache.clear();
+        typePoolSizeCache.clear();
+        typesNeedingAugmentation.clear();
+        variantsGeneratedTypes.clear();
+    }
+
+    /**
+     * MAIN FUNCTIONS
+     */
+
+    private static void generateDummyMUTS(List<String> neglectedMUTs) {
+        // Factory factory = new Launcher().getFactory();
+        long testCaseGenTime = 0;
+        long testParsingTime = 0;
+        long time_budget_ms = 50000;
+        long startTime = System.currentTimeMillis();
+        // 1. 모든 '가짜' 테스트 메소드를 생성하여 리스트에만 저장합니다.
+        List<CtMethod<?>> generatedDummyMethods = new ArrayList<>();
+
+        long generationStartTime = System.currentTimeMillis();
+        for (String neglectedMUT : neglectedMUTs) {
+            // [타이머] 생성 루프 시작 시점에서 시간 초과 여부를 확인합니다.
+            long elapsedTime = System.currentTimeMillis() - startTime;
+            if (elapsedTime >= time_budget_ms) {
+                System.out.println("\n[INFO] SeedAugmentor timed out during generation. Budget: " + time_budget_ms
+                        + "ms, Elapsed: " + elapsedTime + "ms");
+                break; // 생성을 중단합니다.
+            }
+
+            CtMethod<?> neglectedPublicAPI = ASTParser.getCUT_PublicMethods_Map().get(neglectedMUT);
+            if (neglectedPublicAPI == null) {
+                continue;
+            }
+            // System.out.println("Generating Dummy Method for : " + neglectedPublicAPI.getSignature());
+            CtMethod<?> dummyMethod = generateDummyTestMethod(factory, neglectedPublicAPI);
+            if (dummyMethod != null) {
+                // System.out.println("Dummy Method : ");
+                // System.out.println(dummyMethod);
+                generatedDummyMethods.add(dummyMethod);
+            }
+        }
+        testCaseGenTime = System.currentTimeMillis() - generationStartTime;
+
+        // 2. 생성된 모든 '가짜' 메소드들을 한 번에 파싱합니다.
+        long parsingStartTime = System.currentTimeMillis();
+        for (CtMethod<?> dummyMethod : generatedDummyMethods) {
+            try {
+                // ASTParser.processMethodInvokeAndConstructor(dummyMethod);
+                ASTParser.processDummyVartypeTovarnames(dummyMethod);
+            } catch (Exception e) {
+                System.err
+                        .println("Exception raised while parsing a dummy test method: " + dummyMethod.getSimpleName());
+                // e.printStackTrace();
+            }
+        }
+        testParsingTime = System.currentTimeMillis() - parsingStartTime;
+
+        System.out.println("");
+        System.out.println("# of Generated Dummy Methods : " + generatedDummyMethods.size());
+        System.out.println("Dummy TestCase Generation Time : " + testCaseGenTime + " ms");
+        System.out.println("Dummy TestCase Parsing Time : " + testParsingTime + " ms");
+    }
+
+    /**
+     * Generates dummy test method for neglected public API
+     * 
+     * 
+     * @param factory
+     * @param neglectedPublicAPI
+     * @param isStatic
+     * @return
+     */
+    // seqc/SeedAugmentor.java
+
+    private static CtMethod<?> generateDummyTestMethod(
+            Factory factory,
+            CtMethod<?> neglectedPublicAPI) {
+        dummyVarCounter = 0;
+        // 1) 새로 만들 dummy test method 생성 (기존과 동일)
+        CtMethod<Void> dummyTestMethod = factory.createMethod();
+        dummyTestMethod.setSimpleName("dummyTest" + System.currentTimeMillis());
+        dummyTestMethod.setType(factory.Type().createReference(void.class));
+        CtBlock<?> body = factory.createBlock();
+        dummyTestMethod.setBody(body);
+
+        // 2) receiver 및 인자 타입 수집 (개선된 로직 적용)
+        List<CtTypeReference<?>> argTypes = new ArrayList<>();
+        boolean isStatic = isStatic(neglectedPublicAPI);
+
+        if (isStatic) {
+            // Static 메소드는 receiver가 없으므로 null 추가
+            argTypes.add(null);
+        } else {
+            // 인스턴스 메소드는 리시버 타입을 신중하게 결정
+            CtTypeReference<?> originalReceiverType = neglectedPublicAPI.getDeclaringType().getReference();
+            CtType<?> typeDecl = originalReceiverType.getTypeDeclaration();
+
+            // 리시버 타입이 public 구상 클래스가 아니면, 대체 가능한 구현체를 찾습니다.
+            if (typeDecl != null && (typeDecl.isAbstract() || !typeDecl.isPublic())) {
+                // InputCombinations의 개선된 헬퍼 메소드를 호출합니다.
+                CtTypeReference<?> concreteType = InputCombinations.findSuitableImplementation(originalReceiverType);
+                if (concreteType != null) {
+                    argTypes.add(concreteType);
+                } else {
+                    argTypes.add(originalReceiverType); // 대체재를 못 찾으면 원래 타입으로 진행
+                }
+            } else {
+                argTypes.add(originalReceiverType); // public 구상 클래스이면 그대로 추가
+            }
+        }
+        // 파라미터 타입 추가
+        for (CtParameter<?> param : neglectedPublicAPI.getParameters()) {
+            argTypes.add(param.getType());
+        }
+
+        // 3) 각 타입별로 값/변수 준비
+        List<Object> argValues = new ArrayList<>();
+        for (int i = 0; i < argTypes.size(); i++) {
+            CtTypeReference<?> typeRef = argTypes.get(i);
+            if (typeRef == null) { // static 메소드의 receiver 위치
+                argValues.add(null);
+                continue;
+            }
+            CtElement replacableCand = pickRandomPrim(typeRef);
+            if (replacableCand != null) {
+                argValues.add(replacableCand);
+            } else {
+                // 객체 생성이 필요한 경우 createDefaultVarRef 호출
+                argValues.add(createDefaultVarRef(typeRef, factory, body));
+            }
+        }
+
+        // 4) 최종 호출문 생성
+        CtInvocation<?> finalInvocation = factory.createInvocation();
+        finalInvocation.setExecutable((CtExecutableReference) neglectedPublicAPI.getReference());
+
+        if (isStatic) {
+            // Static 호출의 경우, Target을 클래스로 설정
+            CtTypeAccess<?> typeAccess = factory.createTypeAccess(neglectedPublicAPI.getDeclaringType().getReference());
+            finalInvocation.setTarget(typeAccess);
+        } else {
+            // 인스턴스 호출의 경우, receiver 객체를 Target으로 설정
+            Object receiverValue = argValues.get(0);
+            if (receiverValue instanceof CtVariableReference<?>) {
+                CtVariableReference<?> receiverRef = (CtVariableReference<?>) receiverValue;
+                CtVariableRead<?> receiverRead = factory.createVariableRead();
+                receiverRead.setVariable((CtVariableReference) receiverRef);
+                finalInvocation.setTarget(receiverRead);
+            } else {
+                // receiver를 생성하지 못하면 더미 테스트 생성을 중단
+                return null;
+            }
+        }
+
+        // 5) 인자 설정
+        List<CtExpression<?>> arguments = new ArrayList<>();
+        for (int i = 1; i < argValues.size(); i++) { // 인자는 1번 인덱스부터 시작
+            Object argValue = argValues.get(i);
+            if (argValue instanceof CtVariableReference<?>) {
+                CtVariableReference<?> paramRef = (CtVariableReference<?>) argValue;
+                CtVariableRead<?> paramRead = factory.createVariableRead();
+                paramRead.setVariable((CtVariableReference) paramRef);
+                arguments.add(paramRead);
+            } else if (argValue instanceof CtLiteral<?>) {
+                arguments.add((CtLiteral<?>) argValue);
+            } else if (argValue instanceof CtExpression) { // handleDummyParameterVals 등이 CtExpression을 반환하는 경우
+                arguments.add((CtExpression<?>) argValue);
+            } else {
+                arguments.add(factory.createLiteral(null));
+            }
+        }
+        finalInvocation.setArguments(arguments);
+
+        // 6) 메서드 본문에 호출문 추가
+        body.addStatement(finalInvocation);
+        // System.out.println("dummyTestMethod: \n" + dummyTestMethod);
+        return dummyTestMethod;
+
+    }
+
+    private static CtVariableReference<?> createDefaultVarRef(CtTypeReference<?> typeRef, Factory factory,
+            CtBlock<?> body) {
+
+        // 1. handleDummyParameterVals를 호출하여 객체 생성 표현식(initExpr)을 얻어옵니다.
+        // 이 호출은 이제 Object 타입에 대해 Pool에서 실제 객체를 가져와 더 구체적인 표현식을 반환할 수 있습니다.
+        CtExpression<?> initExpr = handleDummyParameterVals(typeRef, body, factory, 0);
+
+        if (initExpr != null) {
+            String varName = "mockUp_" + System.currentTimeMillis() + "_" + dummyVarCounter++;
+
+            // Pool에서 가져온 것이 이미 변수인 경우, 그 변수를 그대로 사용합니다.
+            if (initExpr instanceof CtVariableRead) {
+                return ((CtVariableRead<?>) initExpr).getVariable();
+            }
+
+            // --- [핵심 수정: 모든 변수 선언에 타입 추론 적용] ---
+            // 요청된 타입(typeRef, 예: Object) 대신,
+            // 실제로 생성된 초기화 표현식(initExpr, 예: new ArrayList())의 '실제 타입'을 가져옵니다.
+            CtTypeReference<?> actualType = initExpr.getType();
+
+            // 표현식의 타입을 알 수 없거나(예: null 리터럴) 너무 일반적일 경우, 원래 요청된 타입으로 대체합니다.
+            if (actualType == null || actualType.isImplicit() || actualType.getQualifiedName().equals("?")) {
+                actualType = typeRef;
+            }
+
+            CtLocalVariable localVar = factory.createLocalVariable();
+            localVar.setSimpleName(varName);
+            // setType과 setDefaultExpression 호출 시, 필요한 타입으로 명시적으로 캐스팅합니다.
+            localVar.setType(actualType.clone());
+            localVar.setDefaultExpression((CtExpression) initExpr);
+
+            body.addStatement(localVar);
+            return localVar.getReference();
+        }
+
+        // System.out.println("[ERROR] createDefaultVarRef could not get an initialization expression for: " + typeRef.getQualifiedName());
+        return null;
+    }
+
+    /**
+     * Generates MockUp Variables based on thier Instance or Type
+     */
+
+    private static CtLocalVariable<?> createMockUpVarForType(
+            CtTypeReference<?> typeRef,
+            String varName,
+            Factory factory,
+            CtBlock<?> body) {
+        if (typeRef == null || varName == null)
+            return null;
+        CtLocalVariable<?> localVar = factory.Core().createLocalVariable();
+        localVar.setSimpleName(varName);
+        localVar.setType((CtTypeReference) typeRef);
+
+        CtExpression<?> initExpr = null;
+
+        if (isLiteral(typeRef)) {
+            initExpr = generateMockUpPrims(typeRef, factory);
+        } else {
+            if (typeRef.isArray()) {
+                initExpr = generateMockUpArrays(typeRef, factory, body, 0);
+            } else if (typeRef.isInterface() || isAbstractClass(typeRef)) {
+                initExpr = generateAbstractExpr(typeRef, factory, body, 0);
+            } else {
+                initExpr = generateConcreteExpr(typeRef, factory, body, 0);
+            }
+        }
+
+        if (initExpr != null) {
+            localVar.setDefaultExpression((CtExpression) initExpr);
+        }
+        return localVar;
+    }
+
+    /*
+     * Generates Expression Stmt for MockUp Vars to be initialized
+     * 
+     */
+
+    public static CtExpression<?> createDefaultExpressionForType(CtTypeReference<?> type, Factory factory,
+         CtBlock<?> body, int currentDepth) {
+        
+        
+        // Handle null and special cases
+        if (type == null) {
+            return factory.createLiteral(null);
+        }
+        if (type.getQualifiedName().equals("java.lang.Object")) {
+            return pickRandomElementFromAnyPool(factory, body);
+        }
+
+        // Check cache first
+        CtExpression<?> cachedResult = tryGetFromCreationCache(type, factory, body);
+        if (cachedResult != null) {
+            return cachedResult;
+        }
+
+        // Handle literals separately (no caching needed)
+        if (isLiteral(type)) {
+            return createLiteralExpression(type, factory);
+        }
+
+        // Check depth limit
+        if (currentDepth > Config.MAX_DEPTH) {
+            return generateDefaultConstructorCall(type, factory, body);
+        }
+
+        // Create expression and cache the creation sequence
+        return createAndCacheExpression(type, factory, body, currentDepth);
+    }
+
+    /**
+     * Try to get expression from creation cache
+     */
+    private static CtExpression<?> tryGetFromCreationCache(CtTypeReference<?> type, Factory factory, CtBlock<?> body) {
+        if (!creationSequenceCache.containsKey(type)) {
+            return null;
+        }
+
+        List<CtStatement> cachedStmts = creationSequenceCache.get(type);
+        cachedStmts.forEach(stmt -> body.addStatement(stmt.clone()));
+
+        CtStatement lastStmt = cachedStmts.get(cachedStmts.size() - 1);
+
+        // Handle different types of last statements
+        if (lastStmt instanceof CtLocalVariable) {
+            CtLocalVariable<?> lastVar = (CtLocalVariable<?>) lastStmt;
+            CtVariableRead varRead = factory.createVariableRead();
+            varRead.setVariable(lastVar.getReference());
+            return varRead;
+        } else if (lastStmt instanceof CtInvocation || lastStmt instanceof CtConstructorCall) {
+            return (CtExpression<?>) lastStmt;
+        } else {
+            return makeTypedNull(factory, type);
+        }
+    }
+
+    /**
+     * Create literal expression
+     */
+    private static CtExpression<?> createLiteralExpression(CtTypeReference<?> type, Factory factory) {
+        CtElement replacableCand = pickRandomPrim(type);
+        if (replacableCand != null) {
+            return (CtExpression<?>) replacableCand;
+        } else {
+            return generateMockUpPrims(type, factory);
+        }
+    }
+
+    /**
+     * Create expression and cache the creation sequence
+     */
+    private static CtExpression<?> createAndCacheExpression(CtTypeReference<?> type, Factory factory, 
+            CtBlock<?> body, int currentDepth) {
+        
+        // Record statements before creation
+        int statementsBefore = body.getStatements().size();
+
+        // Create expression based on type
+        CtExpression<?> initExpr = createExpressionByType(type, factory, body, currentDepth);
+
+        // Cache the creation sequence if successful
+        cacheCreationSequenceIfNeeded(type, body, statementsBefore, initExpr);
+
+        return initExpr;
+    }
+
+    /**
+     * Create expression based on type
+     */
+    private static CtExpression<?> createExpressionByType(CtTypeReference<?> type, Factory factory, 
+            CtBlock<?> body, int currentDepth) {
+        
+        if (type.isArray()) {
+            return generateMockUpArrays(type, factory, body, currentDepth + 1);
+        } else if (type.isInterface() || isAbstractClass(type)) {
+            return generateAbstractExpr(type, factory, body, currentDepth + 1);
+        } else {
+            return generateConcreteExpr(type, factory, body, currentDepth + 1);
+        }
+    }
+
+    /**
+     * Cache creation sequence if needed
+     */
+    private static void cacheCreationSequenceIfNeeded(CtTypeReference<?> type, CtBlock<?> body, 
+            int statementsBefore, CtExpression<?> initExpr) {
+        
+        int statementsAfter = body.getStatements().size();
+        if (initExpr != null && !(initExpr instanceof CtLiteral)) {
+            if (statementsAfter > statementsBefore) {
+                List<CtStatement> creationSequence = body.getStatements().subList(statementsBefore, statementsAfter);
+                creationSequenceCache.put(type, new ArrayList<>(creationSequence));
+            }
+        }
+    }
+
+
+    private static CtExpression<?> handleDummyParameterVals(CtTypeReference<?> paramType, CtBlock<?> body,
+            Factory factory, int currentDepth) {
+
+        // 1. Check for basic cases first (primitives, simple types)
+        CtExpression<?> basicResult = tryBasicParameterGeneration(paramType, factory, body, currentDepth);
+        // IMPORTANT: Only return if the result is valid AND not a null literal
+        if (isValidNonNullExpression(basicResult)) {
+            return basicResult;
+        }
+
+        // 2. Try finding replacement from candidate pool FIRST
+        // This allows us to reuse existing objects (like TextNode for JsonNode) before creating new ones
+        CtExpression<?> poolResult = tryGetFromCandidatePool(paramType, body, factory, currentDepth);
+        if (poolResult != null) {
+            return poolResult;
+        }
+
+        // 3. Try creating new object from scratch (as fallback when pool is empty)
+        CtExpression<?> newObjectResult = tryCreateNewObject(paramType, factory, body, currentDepth);
+        // IMPORTANT: Only return if the result is valid AND not a null literal
+        if (isValidNonNullExpression(newObjectResult)) {
+            return newObjectResult;
+        }
+
+        // 4. Final fallback to simple argument
+        return tryFinalFallback(paramType, factory);
+    }
+
+    /**
+     * Try basic parameter generation (primitives, depth limits, etc.)
+     */
+    private static CtExpression<?> tryBasicParameterGeneration(CtTypeReference<?> paramType, Factory factory, 
+            CtBlock<?> body, int currentDepth) {
+        
+        // Check for reusable primitive values first
+        CtElement replacableCand = pickRandomPrim(paramType);
+        if (replacableCand != null) {
+            return (CtExpression) replacableCand;
+        }
+
+        // Check depth limits
+        int maxDepthForRecursive = Math.min(Config.MAX_DEPTH, 3);
+        if (currentDepth > maxDepthForRecursive) {
+            return generateDefaultConstructorCall(paramType, factory, body);
+        }
+
+        // Early exit for complex types at depth > 2
+        if (currentDepth > 2 && !isSimpleType(paramType)) {
+            CtExpression<?> simpleArg = createSimpleArgument(paramType, factory);
+            if (isValidNonNullExpression(simpleArg)) {
+                return simpleArg;
+            }
+            return factory.createLiteral(null);
+        }
+
+        return null;
+    }
+
+    /**
+     * Try creating a new object from scratch
+     */
+    private static CtExpression<?> tryCreateNewObject(CtTypeReference<?> paramType, Factory factory,
+            CtBlock<?> body, int currentDepth) {
+
+        CtBlock<?> tempBodyForCreation = factory.createBlock();
+        CtExpression<?> newlyCreatedExpr = createDefaultExpressionForType(paramType, factory, tempBodyForCreation,
+                currentDepth + 1);
+
+        if (isValidNonNullExpression(newlyCreatedExpr)) {
+            tempBodyForCreation.getStatements().forEach(stmt -> body.addStatement(stmt.clone()));
+            return newlyCreatedExpr;
+        }
+
+        return null;
+    }
+
+    /**
+     * Try getting replacement from candidate pool
+     * NOTE: This function ONLY looks up from the pool, does NOT create new objects
+     */
+    private static CtExpression<?> tryGetFromCandidatePool(CtTypeReference<?> paramType, CtBlock<?> body,
+            Factory factory, int currentDepth) {
+
+        totalPoolAugmentationCalls++;
+
+        // Pure pool lookup - no object creation here
+        CtExpression<?> exprFromPool = lookupCollectedInputs(paramType, body, factory, currentDepth);
+        if (exprFromPool != null) {
+            usedInputPool = true;
+            return exprFromPool;
+        }
+
+        // Pool lookup failed - return null
+        // Object creation will be handled by tryCreateNewObject in handleDummyParameterVals
+        return null;
+    }
+
+    /**
+     * Final fallback attempt
+     */
+    private static CtExpression<?> tryFinalFallback(CtTypeReference<?> paramType, Factory factory) {
+        CtExpression<?> simpleArg = createSimpleArgument(paramType, factory);
+        if (isValidNonNullExpression(simpleArg)) {
+            return simpleArg;
+        }
+
+        return null;
+    }
+
+    /**
+     * Check if a type is simple enough to allow deeper recursion
+     */
+    private static boolean isSimpleType(CtTypeReference<?> type) {
+        if (type == null)
+            return false;
+
+        String typeName = type.getQualifiedName();
+
+        // Primitive types and their wrappers
+        if (type.isPrimitive() ||
+                typeName.startsWith("java.lang.") ||
+                typeName.startsWith("java.util.") ||
+                typeName.equals("java.lang.String")) {
+            return true;
+        }
+
+        // Arrays of simple types
+        if (type.isArray()) {
+            CtTypeReference<?> componentType = ((CtArrayTypeReference<?>) type).getComponentType();
+            return isSimpleType(componentType);
+        }
+
+        return false;
+    }
+
+    private static CtExpression<?> lookupCollectedInputs(CtTypeReference<?> paramType, CtBlock<?> body, Factory factory,
+            int currentDepth) {
+
+        // 1. 호환되는 모든 타입 후보를 수집합니다. (자기 자신 포함)
+        Set<CtTypeReference<?>> compatibleTypes = new HashSet<>();
+        compatibleTypes.add(paramType);
+
+        List<CtTypeReference<?>> implementations = ASTParser.abstractToImplsMap.get(paramType.getQualifiedName());
+
+        if (implementations != null) {
+            compatibleTypes.addAll(implementations);
+        }
+
+        // 2. 호환되는 모든 타입의 변수들을 CandidatePool에서 수집합니다.
+        List<Pair<CtTypeReference, CtElement>> compatibleCandidates = new ArrayList<>();
+
+        // --- [핵심 로직: abstractToImplsMap의 구현체들을 활용하여 pool 검색] ---
+        for (CtTypeReference<?> typeToFind : compatibleTypes) {
+            String typeNameToFind = typeToFind.getQualifiedName();
+
+            // baseVarTypeNamePoolAsList의 모든 키를 순회합니다.
+            for (Map.Entry<CtTypeReference, List<Pair<CtTypeReference, CtElement>>> entry : baseVarTypeNamePoolAsList
+                    .entrySet()) {
+                CtTypeReference<?> keyType = entry.getKey();
+
+                // BUG FIX: Compare with typeToFind (which includes implementations from abstractToImplsMap)
+                // instead of paramType to properly utilize inheritance information
+                if (isCompatibleType(keyType, typeToFind)) {
+                    compatibleCandidates.addAll(entry.getValue());
+                    // Don't break here - there might be multiple compatible entries
+                }
+            }
+        }
+        // --- [수정 끝] ---
+
+        if (!compatibleCandidates.isEmpty()) {
+            // Check if all candidates are null objects
+            boolean allCandidatesAreNull = checkIfAllCandidatesAreNull(compatibleCandidates, paramType);
+            
+            if (allCandidatesAreNull) {
+                // Try to create a new object via constructor instead of using null
+                CtExpression<?> newObject = tryCreateViaConstructorFromPool(paramType, factory, body, currentDepth);
+                if (newObject != null) {
+                    return newObject;
+                }
+            }
+
+            // Pool에서 찾은 후보가 너무 적으면 새로 생성하는 것이 나을 수 있습니다. (기존 로직)
+            // if (compatibleCandidates.size() < 4 && !paramType.isPrimitive()) {
+            // return null;
+            // }
+
+            // 3. 찾은 후보 중 하나를 랜덤으로 선택하여 그 생성 시퀀스를 사용합니다.
+            Pair<CtTypeReference, CtElement> randCand = compatibleCandidates
+                    .get(rand.nextInt(compatibleCandidates.size()));
+            Set<List<CtElement>> inputPool = baseVartypeToInputPool.get(randCand);
+
+            if (inputPool != null && !inputPool.isEmpty()) {
+                List<List<CtElement>> inputPoolList = new ArrayList<>(inputPool);
+                List<CtElement> randomInputSequence = inputPoolList.get(rand.nextInt(inputPoolList.size()));
+
+                if (!randomInputSequence.isEmpty()) {
+                    // 시퀀스의 마지막 구문에서 변수 참조를 추출합니다.
+                    CtElement lastElement = randomInputSequence.get(randomInputSequence.size() - 1);
+                    CtExpression<?> resultExpression = null;
+
+                    if (lastElement instanceof CtAssignment<?, ?>) {
+                        CtAssignment<?, ?> assign = (CtAssignment<?, ?>) lastElement;
+                        if (assign.getAssigned() instanceof CtVariableWrite<?>) {
+                            CtVariableWrite<?> write = (CtVariableWrite<?>) assign.getAssigned();
+                            resultExpression = factory.createVariableRead(write.getVariable(), false);
+                        }
+                    } else if (lastElement instanceof CtLocalVariable<?>) {
+                        resultExpression = factory.createVariableRead(((CtLocalVariable<?>) lastElement).getReference(),
+                                false);
+                    } else if (lastElement instanceof CtInvocationImpl<?>) {
+                        resultExpression = (CtExpression<?>) lastElement;
+                    }
+
+                    // 최종적으로 찾은 객체의 타입이 우리가 필요로 하는 타입과 호환되는지 확인합니다.
+                    // Use isCompatibleType for consistency with the filtering logic above
+                    if (resultExpression != null && resultExpression.getType() != null
+                            && isCompatibleType(resultExpression.getType(), paramType)) {
+                        // 해당 객체를 만드는 데 필요했던 모든 구문(시퀀스)을 현재 메소드 본문에 추가합니다.
+                        addInputStatementsToBody(randomInputSequence, body);
+                        // 생성된 객체를 읽는 표현식을 반환합니다.
+                        return resultExpression;
+                    }
+                }
+            }
+        }
+        return null; // Pool에서 적절한 객체를 찾지 못한 경우
+    }
+
+    /**
+     * Check if all candidates in the pool are null objects
+     */
+    private static boolean checkIfAllCandidatesAreNull(List<Pair<CtTypeReference, CtElement>> candidates, CtTypeReference<?> paramType) {
+        for (Pair<CtTypeReference, CtElement> candidate : candidates) {
+            // Get the input sequences for this candidate
+            Set<List<CtElement>> inputPool = baseVartypeToInputPool.get(candidate);
+            if (inputPool != null && !inputPool.isEmpty()) {
+                for (List<CtElement> sequence : inputPool) {
+                    if (!sequence.isEmpty()) {
+                        CtElement lastElement = sequence.get(sequence.size() - 1);
+                        
+                        // Check if this sequence creates a non-null object
+                        if (lastElement instanceof CtLocalVariable<?>) {
+                            CtLocalVariable<?> var = (CtLocalVariable<?>) lastElement;
+                            CtExpression<?> defaultExpr = var.getDefaultExpression();
+
+                            // Use isValidNonNullExpression for consistency
+                            // This catches null literals, casted nulls, and constructors with all null args
+                            if (isValidNonNullExpression(defaultExpr)) {
+                                return false; // Found at least one non-null candidate
+                            }
+                        } else if (lastElement instanceof CtAssignment<?, ?>) {
+                            CtAssignment<?, ?> assign = (CtAssignment<?, ?>) lastElement;
+                            CtExpression<?> assigned = assign.getAssignment();
+
+                            // Use isValidNonNullExpression for consistency
+                            if (isValidNonNullExpression(assigned)) {
+                                return false; // Found at least one non-null candidate
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return true; // All candidates are null objects
+    }
+
+    /**
+     * Try to create a new object via constructor when pool only has null objects
+     * This creates the object and adds all necessary statements to the body
+     */
+    private static CtExpression<?> tryCreateViaConstructorFromPool(CtTypeReference<?> paramType, Factory factory, CtBlock<?> body, int currentDepth) {
+        // Prevent infinite recursion
+        if (currentDepth > Config.MAX_DEPTH) {
+            return null;
+        }
+        
+        try {
+            // Create temporary body for constructor creation
+            CtBlock<?> tempBody = factory.createBlock();
+            
+            // Try to create using generateConcreteExpr
+            CtExpression<?> newObject = generateConcreteExpr(paramType, factory, tempBody, currentDepth + 1);
+            
+            // Check if the created object is not null
+            if (newObject != null && !isNullLiteral(newObject)) {
+                // Add all statements from tempBody to the actual body (includes dependencies)
+                for (CtStatement stmt : tempBody.getStatements()) {
+                    body.addStatement(stmt.clone());
+                }
+                
+                // Create variable for the final object
+                String varName = generateActualVarName(paramType);
+                CtLocalVariable<?> objectVar = factory.createLocalVariable();
+                objectVar.setSimpleName(varName);
+                objectVar.setType((CtTypeReference) paramType.clone());
+                objectVar.setDefaultExpression((CtExpression) newObject);
+                body.addStatement(objectVar);
+                
+                // Return variable read for the created object
+                CtVariableRead<?> varRead = factory.createVariableRead();
+                varRead.setVariable((CtVariableReference) objectVar.getReference());
+                
+                return varRead;
+            }
+        } catch (Exception e) {
+            // Constructor creation failed
+        }
+        
+        return null;
+    }
+
+    private static CtExpression<?> generateMockUpPrims(CtTypeReference<?> typeRef, Factory factory) {
+        if (typeRef == null) {
+            throw new IllegalArgumentException("typeRef cannot be null");
+        }
+
+        CtExpression<?> initExpr = null;
+        if (isLiteral(typeRef)) {
+            switch (typeRef.getSimpleName()) {
+                case "int":
+                case "short":
+                case "byte":
+                case "long":
+                    initExpr = factory.createLiteral(0);
+                    break;
+                case "float":
+                case "double":
+                    initExpr = factory.createLiteral(0.0);
+                    break;
+                case "boolean":
+                    initExpr = factory.createLiteral(false);
+                    break;
+                case "char":
+                    initExpr = factory.createLiteral('a');
+                    break;
+                case "String":
+                    initExpr = factory.createLiteral("dummy");
+                    break;
+                default:
+                    initExpr = null; // void 등 특수 케이스
+                    break;
+            }
+        }
+        return initExpr;
+    }
+
+    // seqc/SeedAugmentor.java
+
+    private static CtExpression<?> generateMockUpArrays(CtTypeReference<?> typeRef, Factory factory, CtBlock<?> body,
+            int currentDepth) {
+        if (typeRef == null) {
+            throw new IllegalArgumentException("typeRef cannot be null");
+        }
+
+        if (currentDepth > Config.MAX_DEPTH) {
+            return factory.createLiteral(null);
+        }
+
+        if (typeRef instanceof CtArrayTypeReference<?>) {
+            CtArrayTypeReference<?> arrayTypeRef = (CtArrayTypeReference<?>) typeRef;
+            CtTypeReference<?> componentType = arrayTypeRef.getComponentType();
+
+            // --- [핵심 수정: Raw Type 및 올바른 API 사용] ---
+            // CtNewArray<?> 대신 Raw Type 'CtNewArray'를 사용합니다.
+            CtNewArray newArray = factory.createNewArray();
+
+            if (componentType.getQualifiedName().equals("java.lang.Object")) {
+                CtExpression<?> randomElement = pickRandomElementFromAnyPool(factory, body);
+
+                if (randomElement != null) {
+                    CtTypeReference<?> actualComponentType = randomElement.getType();
+                    if (actualComponentType != null && !actualComponentType.isImplicit()) {
+                        // createArrayTypeReference는 인자 없이 호출 후, setComponentType을 사용해야 합니다.
+                        CtArrayTypeReference actualArrayType = factory.createArrayTypeReference();
+                        actualArrayType.setComponentType(actualComponentType);
+
+                        newArray.setType(actualArrayType);
+                        newArray.setElements(Collections.singletonList(randomElement));
+                        return newArray;
+                    }
+                }
+                newArray.setType(arrayTypeRef.clone());
+                newArray.setElements(Collections.singletonList((CtExpression) makeTypedNull(factory, arrayTypeRef.getComponentType())));
+                return newArray;
+            } else {
+                newArray.setType(typeRef.clone());
+                CtExpression<?> initExpr = createDefaultExpressionForType(componentType, factory, body,
+                        currentDepth + 1);
+                newArray.setElements(Collections.singletonList(initExpr));
+                return newArray;
+            }
+        }
+
+        return factory.createLiteral(null);
+    }
+
+    private static CtExpression<?> pickRandomElementFromAnyPool(Factory factory, CtBlock<?> body) {
+        List<CtExpression<?>> candidates = new ArrayList<>();
+
+        if (baseDirectToValuesAsList != null && !baseDirectToValuesAsList.isEmpty()) {
+            List<CtTypeReference<?>> types = new ArrayList<>(baseDirectToValuesAsList.keySet());
+            CtTypeReference<?> randomType = types.get(rand.nextInt(types.size()));
+            List<CtElement> values = baseDirectToValuesAsList.get(randomType);
+            if (values != null && !values.isEmpty()) {
+                candidates.add((CtExpression<?>) values.get(rand.nextInt(values.size())));
+            }
+        }
+
+        if (baseVartypeToInputPool != null && !baseVartypeToInputPool.isEmpty()) {
+            List<Pair<CtTypeReference, CtElement>> keys = new ArrayList<>(baseVartypeToInputPool.keySet());
+            Pair<CtTypeReference, CtElement> randomKey = keys.get(rand.nextInt(keys.size()));
+
+            Set<List<CtElement>> sequences = baseVartypeToInputPool.get(randomKey);
+            if (sequences != null && !sequences.isEmpty()) {
+                List<CtElement> randomSequence = new ArrayList<>(sequences).get(0);
+                if (!randomSequence.isEmpty()) {
+                    addInputStatementsToBody(randomSequence, body);
+
+                    CtElement lastElement = randomSequence.get(randomSequence.size() - 1);
+                    if (lastElement instanceof CtLocalVariable) {
+                        return factory.createVariableRead(((CtLocalVariable<?>) lastElement).getReference(), false);
+                    }
+                }
+            }
+        }
+
+        if (!candidates.isEmpty()) {
+            return candidates.get(rand.nextInt(candidates.size()));
+        }
+
+        return null;
+    }
+
+    private static CtExpression<?> generateAbstractExpr(
+            CtTypeReference<?> typeRef,
+            Factory factory,
+            CtBlock<?> body,
+            int currentDepth) {
+
+        // Check if the abstract type is accessible
+        if (!isTypeAccessible(typeRef)) {
+            // Abstract type is not accessible, return null
+            return makeTypedNull(factory, typeRef);
+        }
+
+        // --- [NEW: 우선순위 1 - Factory 메소드 탐색] ---
+        CtInvocation<?> factoryMethodCall = tryCreateFromFactoryMethod(typeRef, factory, body, currentDepth);
+        if (factoryMethodCall != null) {
+            return factoryMethodCall;
+        }
+
+        // 1. 하드코딩된 규칙 맵을 사용하여 흔한 추상 타입을 처리합니다.
+        Map<String, Class<?>> abstractTypeToImpl = new HashMap<>();
+        abstractTypeToImpl.put("java.util.List", ArrayList.class);
+        abstractTypeToImpl.put("java.util.Map", HashMap.class);
+        abstractTypeToImpl.put("java.util.Set", HashSet.class);
+        abstractTypeToImpl.put("java.io.Writer", java.io.StringWriter.class);
+        abstractTypeToImpl.put("java.lang.Number", Long.class); // Number의 기본 구현체로 Long을 사용
+
+        String qualifiedName = typeRef.getQualifiedName();
+        Class<?> implClass = abstractTypeToImpl.get(qualifiedName);
+
+        if (implClass != null) {
+            CtConstructorCall<?> constructorCall = factory.createConstructorCall();
+            constructorCall.setType((CtTypeReference) factory.Type().createReference(implClass));
+
+            // [핵심 수정] 각 클래스에 맞는 유효한 생성자 인자를 제공합니다.
+            if (implClass == String.class) {
+                constructorCall.setArguments(Collections.singletonList(factory.createLiteral("dummy")));
+            } else if (implClass == Long.class) {
+                // Long 클래스는 인자가 없는 기본 생성자가 없으므로, 유효한 인자(0L)를 넣어줍니다.
+                constructorCall.setArguments(Collections.singletonList(factory.createLiteral(0L)));
+            }
+            // ArrayList, HashMap 등은 인자 없는 기본 생성자 호출이 유효하므로 별도 처리가 필요 없습니다.
+
+            return constructorCall;
+        }
+
+        // 2. 맵에 규칙이 없으면, 프로젝트 코드 내에서 구현체를 탐색합니다.
+        CtExpression<?> foundExpr = tryFindConcreteImplementation(typeRef, factory, body, currentDepth + 1);
+        if (foundExpr != null) {
+            return foundExpr;
+        }
+
+        // 3. 모든 방법이 실패하면 null을 반환합니다.
+        // System.err.println("No concrete implementation or rule found for abstract
+        // type: " + typeRef);
+        return makeTypedNull(factory, typeRef);
+    }
+
+    private static CtExpression<?> tryFindConcreteImplementation(CtTypeReference<?> typeRef, Factory factory,
+            CtBlock<?> body, int currentDepth) {
+        String abstractKey = typeRef.getQualifiedName();
+
+        // Try both with and without generic parameters
+        List<CtTypeReference<?>> impls = ASTParser.getAbstractToImplsMap().get(typeRef.getQualifiedName());
+
+        // If not found, try removing generic parameters
+        if (impls == null || impls.isEmpty()) {
+            String baseType = typeRef.getQualifiedName().replaceAll("<.*>", "");
+            if (!baseType.equals(typeRef.getQualifiedName())) {
+                impls = ASTParser.getAbstractToImplsMap().get(baseType);
+            }
+        }
+
+        if (impls != null && !impls.isEmpty()) {
+            // Check if the abstract type itself is accessible
+            if (!isTypeAccessible(typeRef)) {
+                // Abstract type is not accessible, skip variant generation
+                return null;
+            }
+
+            // Check if we've already generated variants for this type
+            if (variantsGeneratedTypes.contains(abstractKey)) {
+                // Just return one random implementation without generating more variants
+                Random rand = new Random();
+                CtTypeReference<?> selectedImpl = impls.get(rand.nextInt(impls.size()));
+                CtConstructor<?> constructor = findMatchingConstructor(selectedImpl, factory);
+                if (constructor != null) {
+                    return createConstructorCallFromConstructor(constructor, factory, body, currentDepth, selectedImpl);
+                }
+                return null;
+            }
+
+            // Mark this type as having variants generated
+            variantsGeneratedTypes.add(abstractKey);
+
+            // [DIVERSITY] Generate up to 3 diverse implementations (not including null)
+            int variantsToGenerate = Math.min(3, impls.size()); // Generate up to 3 variants
+            List<CtTypeReference<?>> shuffledImpls = new ArrayList<>(impls);
+            Collections.shuffle(shuffledImpls, rand);
+
+            CtExpression<?> firstSuccessful = null;
+            int successCount = 0;
+
+            for (int i = 0; i < shuffledImpls.size() && successCount < variantsToGenerate; i++) {
+                CtTypeReference<?> impl = shuffledImpls.get(i);
+
+                // Skip implementations that are not accessible
+                if (!isTypeAccessible(impl)) {
+                    continue;
+                }
+
+                CtConstructor<?> constructor = findMatchingConstructor(impl, factory);
+
+                if (constructor != null) {
+                    CtBlock<?> tempBody = factory.createBlock();
+                    CtExpression<?> expr = createConstructorCallFromConstructor(constructor, factory, tempBody, currentDepth, impl);
+
+                    if (expr != null) {
+                        // Create a variable for this variant and add sequence to pool
+                        String varName = "variant_" + impl.getSimpleName() + "_" + System.currentTimeMillis() + "_" + dummyVarCounter++;
+                        CtLocalVariable<?> varDecl = factory.createLocalVariable();
+                        varDecl.setSimpleName(varName);
+                        varDecl.setType((CtTypeReference) typeRef.clone());
+                        varDecl.setDefaultExpression((CtExpression) expr.clone());
+
+                        // Build the complete sequence: all statements + variable declaration
+                        List<CtElement> sequence = new ArrayList<>();
+                        tempBody.getStatements().forEach(stmt -> sequence.add(stmt.clone()));
+                        sequence.add(varDecl);
+
+                        // Add to vartypeToInputPool with the sequence - use getReference()!
+                        Pair<CtTypeReference, CtElement> pair = new Pair<>(typeRef, varDecl.getReference());
+                        CandidatePool.insertVarTypeToInputPool(pair, sequence);
+
+                        // Keep first successful one to return
+                        if (firstSuccessful == null) {
+                            firstSuccessful = expr;
+                            tempBody.getStatements().forEach(stmt -> body.addStatement(stmt.clone()));
+                            abstractConstructorCache.put(abstractKey, constructor);
+                        }
+
+                        successCount++;
+                    }
+                }
+            }
+
+            // After generating variants, also add a null object (separate from the 3 variants)
+            if (firstSuccessful != null && !hasNullObjectInPool(typeRef)) {
+                String nullVarName = "null_" + typeRef.getSimpleName() + "_" + System.currentTimeMillis() + "_" + dummyVarCounter++;
+                CtLocalVariable<?> nullVar = factory.createLocalVariable();
+                nullVar.setSimpleName(nullVarName);
+                nullVar.setType((CtTypeReference) typeRef.clone());
+                nullVar.setDefaultExpression(factory.createLiteral(null));
+
+                // Insert null object into CandidatePool
+                List<CtElement> nullStmts = new ArrayList<>();
+                nullStmts.add(nullVar);
+
+                Pair<CtTypeReference, CtElement> nullTypeAndName = new Pair<>(typeRef, nullVar.getReference());
+                CandidatePool.insertVarTypeToInputPool(nullTypeAndName, nullStmts);
+            }
+
+            return firstSuccessful;
+        }
+
+        return null; // 구현체를 찾지 못한 경우
+    }
+
+    /**
+     * Optimized factory method creation with caching to reduce overhead
+     */
+    public static CtInvocation<?> tryCreateFromFactoryMethod(CtTypeReference<?> typeRef, Factory factory,
+            CtBlock<?> body, int currentDepth) {
+        if (currentDepth > Config.MAX_DEPTH) {
+            return null;
+        }
+
+        String typeName = typeRef.getQualifiedName();
+
+        // Check cache first
+        List<CtMethod<?>> cachedFactoryMethods = factoryMethodCache.get(typeName);
+        if (cachedFactoryMethods == null) {
+            // Build cache entry
+            cachedFactoryMethods = buildFactoryMethodCache(typeRef);
+            factoryMethodCache.put(typeName, cachedFactoryMethods);
+        }
+
+        if (cachedFactoryMethods.isEmpty()) {
+            return null;
+        }
+
+        // Try cached factory methods in priority order
+        for (CtMethod<?> factoryMethod : cachedFactoryMethods) {
+            CtBlock<?> tempBody = factory.createBlock();
+            CtInvocation<?> methodCall = createFactoryMethodCall(factoryMethod, factory, tempBody, currentDepth);
+
+            if (methodCall != null) {
+                tempBody.getStatements().forEach(stmt -> body.addStatement(stmt.clone()));
+                // System.out.println("[FACTORY] Created object using factory method: " +
+                //         factoryMethod.getDeclaringType().getSimpleName() + "." + factoryMethod.getSimpleName());
+                return methodCall;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Build and cache factory methods for a type (called once per type)
+     */
+    private static List<CtMethod<?>> buildFactoryMethodCache(CtTypeReference<?> typeRef) {
+        HashMap<String, Set<CtMethod<?>>> allMethodsMap = ASTParser.getAllMethods();
+        Set<CtMethod<?>> methods = allMethodsMap.get(typeRef.getQualifiedName());
+
+        if (methods == null || methods.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<CtMethod<?>> factoryMethodCandidates = new ArrayList<>();
+        String targetPackage = Config.PACKAGE;
+
+        for (CtMethod<?> method : methods) {
+            // Quick checks first (most likely to fail)
+            if (!method.hasModifier(ModifierKind.STATIC)) {
+                continue;
+            }
+
+            // Method name pattern check (fast string operation)
+            String methodName = method.getSimpleName();
+            if (!isFactoryMethodName(methodName)) {
+                continue;
+            }
+
+            // Accessibility check
+            if (!isMethodAccessible(method, targetPackage)) {
+                continue;
+            }
+
+            // Return type compatibility (expensive check last)
+            CtTypeReference<?> returnType = method.getType();
+            if (returnType != null && isCompatibleTypeCached(returnType, typeRef)) {
+                factoryMethodCandidates.add(method);
+            }
+        }
+
+        // Sort once and cache the result
+        factoryMethodCandidates.sort((m1, m2) -> {
+            int paramDiff = m1.getParameters().size() - m2.getParameters().size();
+            if (paramDiff != 0) {
+                return paramDiff;
+            }
+
+            String name1 = m1.getSimpleName();
+            String name2 = m2.getSimpleName();
+            int priority1 = getFactoryMethodPriority(name1);
+            int priority2 = getFactoryMethodPriority(name2);
+            return priority1 - priority2;
+        });
+
+        return factoryMethodCandidates;
+    }
+
+    /**
+     * Fast factory method name check using pre-built set
+     */
+    private static boolean isFactoryMethodName(String methodName) {
+        if (factoryMethodNames.contains(methodName)) {
+            return true;
+        }
+
+        // Check prefixes for common patterns (createXxx, buildXxx, etc.)
+        for (String factoryName : factoryMethodNames) {
+            if (methodName.startsWith(factoryName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Optimized method accessibility check
+     */
+    private static boolean isMethodAccessible(CtMethod<?> method, String targetPackage) {
+        // private 메소드는 같은 패키지여도 접근 불가
+        if (method.isPrivate()) {
+            return false;
+        }
+
+        if (method.isPublic()) {
+            return true;
+        }
+
+        String methodPackage = (method.getDeclaringType().getPackage() != null)
+                ? method.getDeclaringType().getPackage().getQualifiedName()
+                : "";
+
+        return methodPackage.equals(targetPackage);
+    }
+
+    /**
+     * Returns priority value for factory method names (lower = higher priority)
+     */
+    private static int getFactoryMethodPriority(String methodName) {
+        if (methodName.equals("getInstance"))
+            return 0;
+        if (methodName.equals("newInstance"))
+            return 1;
+        if (methodName.equals("create"))
+            return 2;
+        if (methodName.equals("createInstance"))
+            return 3;
+        if (methodName.equals("valueOf"))
+            return 4;
+        if (methodName.equals("of"))
+            return 5;
+        if (methodName.equals("from"))
+            return 6;
+        if (methodName.equals("parse"))
+            return 7;
+        if (methodName.equals("build"))
+            return 8;
+        if (methodName.equals("get"))
+            return 9;
+        return 10; // Other factory methods
+    }
+
+    /**
+     * Cached version of type compatibility check to reduce overhead
+     */
+    public static boolean isCompatibleTypeCached(CtTypeReference<?> returnType, CtTypeReference<?> targetType) {
+        String cacheKey = returnType.getQualifiedName() + ":" + targetType.getQualifiedName();
+        Boolean cached = typeCompatibilityCache.get(cacheKey);
+
+        if (cached != null) {
+            return cached;
+        }
+
+        boolean compatible = isCompatibleType(returnType, targetType);
+        typeCompatibilityCache.put(cacheKey, compatible);
+        return compatible;
+    }
+
+    /**
+     * Checks if return type is compatible with target type
+     */
+    private static boolean isCompatibleType(CtTypeReference<?> returnType, CtTypeReference<?> targetType) {
+        if (returnType == null || targetType == null) {
+            return false;
+        }
+        
+        // Fast equality check first
+        if (returnType.equals(targetType)) {
+            return true;
+        }
+
+        // CRITICAL: Array types and base types should NOT be compatible
+        // DateTimeFieldType[] should NOT be compatible with DateTimeFieldType
+        if (returnType.isArray() != targetType.isArray()) {
+            return false;
+        }
+        
+        // If both are arrays, check their component types
+        if (returnType.isArray() && targetType.isArray()) {
+            // For arrays, compare the qualified names without the [] suffix
+            String returnTypeName = returnType.getQualifiedName().replace("[]", "");
+            String targetTypeName = targetType.getQualifiedName().replace("[]", "");
+            return returnTypeName.equals(targetTypeName);
+        }
+
+        // For generic types, we need to check both the raw type and type arguments
+        if (returnType.getActualTypeArguments() != null && !returnType.getActualTypeArguments().isEmpty() ||
+            targetType.getActualTypeArguments() != null && !targetType.getActualTypeArguments().isEmpty()) {
+
+            // Both must have the same raw type first
+            if (!returnType.getQualifiedName().equals(targetType.getQualifiedName())) {
+                return false;
+            }
+
+            // Check if both have type arguments
+            List<CtTypeReference<?>> returnArgs = returnType.getActualTypeArguments();
+            List<CtTypeReference<?>> targetArgs = targetType.getActualTypeArguments();
+
+            // If one has type arguments and the other doesn't, they're not compatible
+            if ((returnArgs == null || returnArgs.isEmpty()) != (targetArgs == null || targetArgs.isEmpty())) {
+                return false;
+            }
+
+            // If both have type arguments, they must match
+            if (returnArgs != null && targetArgs != null &&
+                returnArgs.size() == targetArgs.size()) {
+                for (int i = 0; i < returnArgs.size(); i++) {
+                    if (!isCompatibleType(returnArgs.get(i), targetArgs.get(i))) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            // If type arguments don't match in size, not compatible
+            return false;
+        }
+
+        // Fast qualified name check for non-generic types
+        String returnTypeName = returnType.getQualifiedName();
+        String targetTypeName = targetType.getQualifiedName();
+        if (returnTypeName.equals(targetTypeName)) {
+            return true;
+        }
+
+        // Expensive subtype check last
+        try {
+            return returnType.isSubtypeOf(targetType);
+        } catch (Exception e) {
+            // If subtype checking fails, assume incompatible
+            return false;
+        }
+    }
+
+    /**
+     * Creates a factory method call with appropriate parameters
+     */
+    private static CtInvocation<?> createFactoryMethodCall(CtMethod<?> factoryMethod, Factory factory, CtBlock<?> body,
+            int currentDepth) {
+        CtInvocation<?> methodCall = factory.createInvocation();
+        methodCall.setExecutable((CtExecutableReference) factoryMethod.getReference());
+
+        // Set target to the class (since it's a static method)
+        CtTypeAccess<?> typeAccess = factory.createTypeAccess();
+        typeAccess.setAccessedType((CtTypeReference) factoryMethod.getDeclaringType().getReference());
+        methodCall.setTarget(typeAccess);
+
+        // Generate arguments for the factory method
+        List<CtExpression<?>> args = new ArrayList<>();
+
+        for (CtParameter<?> param : factoryMethod.getParameters()) {
+            CtTypeReference<?> paramType = param.getType();
+            CtExpression<?> paramInitExpr = handleDummyParameterVals(paramType, body, factory, currentDepth + 1);
+
+            // Safety check
+            if (paramInitExpr != null && paramInitExpr.getType() != null
+                    && !paramInitExpr.getType().isSubtypeOf(paramType)) {
+                paramInitExpr = null;
+            }
+
+            if (paramInitExpr == null ||
+                    (isNullLiteral(paramInitExpr) && !paramType.getQualifiedName().equals("java.lang.Object"))) {
+                // Try to create a simple default value for the parameter
+                CtExpression<?> simpleDefault = createSimpleArgument(paramType, factory);
+                args.add(simpleDefault);
+                continue;
+            }
+
+            if (isLiteral(paramType) || usedInputPool) {
+                args.add(paramInitExpr);
+                usedInputPool = false;
+            } else {
+                // Create local variable for complex parameters
+                String argVarName = "factoryParam_" + System.currentTimeMillis() + "_" + dummyVarCounter++;
+                CtLocalVariable<?> localVar = factory.createLocalVariable();
+                localVar.setSimpleName(argVarName);
+                localVar.setType((CtTypeReference) paramType.clone());
+                localVar.setDefaultExpression((CtExpression) paramInitExpr);
+                body.addStatement(localVar);
+
+                CtVariableRead<?> varRead = factory.createVariableRead();
+                varRead.setVariable((CtVariableReference) localVar.getReference());
+                args.add(varRead);
+            }
+        }
+
+        methodCall.setArguments(args);
+        return methodCall;
+    }
+
+    private static CtExpression<?> generateConcreteExpr(CtTypeReference<?> typeRef, Factory factory, CtBlock<?> body,
+            int currentDepth) {
+        // Check if the type is accessible
+        if (!isTypeAccessible(typeRef)) {
+            // Type is not accessible, return null
+            return makeTypedNull(factory, typeRef);
+        }
+
+        // Check if the type can be instantiated (not abstract, not interface)
+        if (!isInstantiable(typeRef)) {
+            // Type is abstract or interface, try to find implementation
+            return generateAbstractExpr(typeRef, factory, body, currentDepth);
+        }
+
+        if (currentDepth > Config.MAX_DEPTH) {
+            return generateDefaultConstructorCall(typeRef, factory, body);
+        }
+
+        // --- [NEW: 우선순위 1 - Factory 메소드 탐색] ---
+        CtInvocation<?> factoryMethodCall = tryCreateFromFactoryMethod(typeRef, factory, body, currentDepth);
+        if (factoryMethodCall != null) {
+            return factoryMethodCall;
+        }
+
+        Map<String, Set<CtConstructor<?>>> constructorsMap = ASTParser.getAll_Constructors_Map();
+        Set<CtConstructor<?>> allConstructors = constructorsMap.get(typeRef.getQualifiedName());
+
+
+        if (allConstructors != null && !allConstructors.isEmpty()) {
+            // --- [핵심 수정: 접근 가능한 생성자 필터링 및 우선순위 부여] ---
+            String targetTestPackage = Config.PACKAGE;
+            
+            // If Config.PACKAGE is empty, try to get the package from the type itself
+            if (targetTestPackage == null || targetTestPackage.isEmpty()) {
+                if (typeRef.getPackage() != null) {
+                    targetTestPackage = typeRef.getPackage().getQualifiedName();
+                }
+            }
+            
+            List<CtConstructor<?>> accessibleCandidates = new ArrayList<>();
+
+            for (CtConstructor<?> constructor : allConstructors) {
+                String constructorPackage = (constructor.getDeclaringType().getPackage() != null)
+                        ? constructor.getDeclaringType().getPackage().getQualifiedName()
+                        : "";
+
+                // 조건: private이 아니고, 1) public 이거나, 2) 생성될 테스트와 같은 패키지에 속해 있는가?
+                boolean isAccessible = !constructor.isPrivate() && (constructor.isPublic() || constructorPackage.equals(targetTestPackage));
+
+                if (isAccessible) {
+                    accessibleCandidates.add(constructor);
+                }
+            }
+            // --- [수정 끝] ---
+
+
+            // 접근 가능한 후보가 있을 경우에만 생성자 호출을 시도합니다.
+            if (!accessibleCandidates.isEmpty()) {
+                Random rand = new Random();
+
+                // 1. 접근 가능한 후보 중에서 무작위로 하나를 먼저 시도합니다.
+                int randomIndex = rand.nextInt(accessibleCandidates.size());
+                CtConstructor<?> firstAttemptConstructor = accessibleCandidates.remove(randomIndex);
+                CtBlock<?> tempBodyFirst = factory.createBlock();
+                CtConstructorCall<?> callFirst = createConstructorCallFromConstructor(firstAttemptConstructor, factory,
+                        tempBodyFirst, currentDepth, typeRef);
+
+                if (callFirst != null) {
+                    tempBodyFirst.getStatements().forEach(stmt -> body.addStatement(stmt.clone()));
+                    return callFirst;
+                }
+
+                // 2. 실패하면, 나머지 접근 가능한 후보들을 파라미터 개수가 적은 순으로 정렬하여 시도합니다.
+                accessibleCandidates.sort(Comparator.comparingInt(c -> c.getParameters().size()));
+
+                for (CtConstructor<?> constructor : accessibleCandidates) {
+                    CtBlock<?> tempBody = factory.createBlock();
+                    CtConstructorCall<?> call = createConstructorCallFromConstructor(constructor, factory, tempBody,
+                            currentDepth, typeRef);
+
+                    if (call != null) {
+                        tempBody.getStatements().forEach(stmt -> body.addStatement(stmt.clone()));
+                        return call;
+                    }
+                }
+            }
+        }
+
+        // (이하 recursiveMethodCalls 등의 Fallback 로직은 기존과 동일)
+        if (recursiveMethodCalls) {
+            CtMethod<?> selectedMethod = findMatchingMethod(typeRef, factory);
+            if (selectedMethod != null) {
+                return createMethodInvo(selectedMethod, factory, body, currentDepth);
+            }
+        }
+
+        return generateDefaultConstructorCall(typeRef, factory, body);
+    }
+
+    private static CtExpression<?> generateDefaultConstructorCall(CtTypeReference<?> type, Factory factory,
+            CtBlock<?> body) {
+        if (type == null) {
+            return factory.createLiteral(null);
+        }
+
+        // Handle String specially
+        if ("java.lang.String".equals(type.getQualifiedName())) {
+            return factory.createLiteral("");
+        }
+
+        // Check if the type can be instantiated
+        if (!isInstantiable(type)) {
+            // Type is abstract or interface, cannot create constructor call
+            return makeTypedNull(factory, type);
+        }
+
+        // Try to find any available constructor for the type
+        Map<String, Set<CtConstructor<?>>> constructorsMap = ASTParser.getAll_Constructors_Map();
+        Set<CtConstructor<?>> allConstructors = constructorsMap.get(type.getQualifiedName());
+
+        if (allConstructors != null && !allConstructors.isEmpty()) {
+            // Find the constructor with the fewest parameters that we can satisfy
+            List<CtConstructor<?>> sortedConstructors = new ArrayList<>(allConstructors);
+            sortedConstructors.sort(Comparator.comparingInt(c -> c.getParameters().size()));
+
+            for (CtConstructor<?> constructor : sortedConstructors) {
+                // Check if constructor is accessible
+                String constructorPackage = (constructor.getDeclaringType().getPackage() != null)
+                        ? constructor.getDeclaringType().getPackage().getQualifiedName()
+                        : "";
+                boolean isAccessible = !constructor.isPrivate() && (constructor.isPublic() || constructorPackage.equals(Config.PACKAGE));
+
+                if (isAccessible) {
+                    try {
+                        // Try to create constructor call with simplified parameters
+                        CtConstructorCall<?> constructorCall = createSimpleConstructorCall(constructor, factory, body);
+                        if (constructorCall != null) {
+                            return constructorCall;
+                        }
+                    } catch (Exception e) {
+                        // Continue to next constructor if this one fails
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // If no constructor can be created, return null
+        return makeTypedNull(factory, type);
+    }
+
+    /**
+     * Create a constructor call with minimal complexity for fallback cases
+     */
+    private static CtConstructorCall<?> createSimpleConstructorCall(CtConstructor<?> constructor, Factory factory,
+            CtBlock<?> body) {
+        
+        CtTypeReference<?> declaringType = constructor.getDeclaringType().getReference();
+        CtConstructorCall<?> constructorCall = createBasicConstructorCall(factory, declaringType);
+        
+        List<CtExpression<?>> args = generateArgumentsWithFallback(
+            constructor.getParameters(), factory, body, 0, true);
+        
+        constructorCall.setArguments(args);
+        return constructorCall;
+    }
+
+    /**
+     * Create simple arguments for constructors with intelligent object creation
+     */
+    public static CtExpression<?> createSimpleArgument(CtTypeReference<?> paramType, Factory factory) {
+        return createSimpleArgumentWithDepth(paramType, factory, 0);
+    }
+
+    /**
+     * Create arguments with controlled depth to avoid infinite recursion
+     */
+    public static CtExpression<?> createSimpleArgumentWithDepth(CtTypeReference<?> paramType, Factory factory,
+            int depth) {
+        if (paramType == null) {
+            return factory.createLiteral(null);
+        }
+
+        // Prevent deep recursion
+        if (depth > 2) {
+            return SeedAugmentor.makeTypedNull(factory, paramType);
+        }
+
+        // Try primitive default first
+        CtExpression<?> primitiveDefault = createPrimitiveDefault(paramType, factory, "dummy", true);
+        if (primitiveDefault != null) {
+            return primitiveDefault;
+        }
+
+        // For complex types, delegate to complex argument creation
+        return createComplexArgument(paramType, factory, depth);
+    }
+
+    /**
+     * Handle complex argument creation with multiple strategies
+     */
+    private static CtExpression<?> createComplexArgument(CtTypeReference<?> paramType, Factory factory, int depth) {
+        String typeName = paramType.getQualifiedName();
+        // System.out.println("[DEBUG] Creating complex argument for: " + typeName + "
+        // at depth: " + depth);
+
+        // Check if the type can be instantiated
+        if (!isInstantiable(paramType)) {
+            // Type is abstract or interface, return null
+            return makeTypedNull(factory, paramType);
+        }
+
+        // 1. Try to get from existing pool first (highest priority)
+        CtElement existing = pickRandomPrim(paramType);
+        if (existing != null) {
+            // System.out.println("[DEBUG] Found existing primitive: " +
+            // existing.toString());
+            return (CtExpression<?>) existing;
+        }
+
+        // 2. Try to find from collected inputs
+        if (baseVarTypeNamePoolAsList != null) {
+            for (Map.Entry<CtTypeReference, List<Pair<CtTypeReference, CtElement>>> entry : baseVarTypeNamePoolAsList
+                    .entrySet()) {
+                CtTypeReference<?> poolType = entry.getKey();
+                if (isCompatibleType(poolType, paramType)) {
+                    List<Pair<CtTypeReference, CtElement>> candidates = entry.getValue();
+                    if (!candidates.isEmpty()) {
+                        // Create a variable reference to the pooled object
+                        Pair<CtTypeReference, CtElement> candidate = candidates.get(rand.nextInt(candidates.size()));
+                        if (candidate.getValue() instanceof CtVariable) {
+                            CtVariable<?> var = (CtVariable<?>) candidate.getValue();
+                            CtVariableRead<?> varRead = factory.createVariableRead();
+                            varRead.setVariable((CtVariableReference) var.getReference());
+                            return varRead;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Try common patterns for known interface types
+        CtExpression<?> commonImpl = createCommonImplementation(paramType, factory, depth);
+        if (commonImpl != null) {
+            return commonImpl;
+        }
+
+        // 4. Try to create via constructor
+        CtExpression<?> constructorCall = tryCreateViaConstructor(paramType, factory, depth);
+        if (constructorCall != null) {
+            return constructorCall;
+        }
+
+        // 5. Try factory methods as last resort
+        CtExpression<?> factoryCall = tryCreateViaFactoryMethod(paramType, factory, depth);
+        if (factoryCall != null) {
+            return factoryCall;
+        }
+
+        // System.out.println("[DEBUG] Attempting force creation for: " + typeName);
+        try {
+            Map<String, Set<CtConstructor<?>>> constructorsMap = ASTParser.getAll_Constructors_Map();
+            Set<CtConstructor<?>> constructors = constructorsMap.get(typeName);
+
+            if (constructors != null) {
+                // Find the simplest constructor (0 parameters first)
+                CtConstructor<?> simplestConstructor = null;
+                int minParams = Integer.MAX_VALUE;
+
+                for (CtConstructor<?> constructor : constructors) {
+                    if (constructor.isPublic() && constructor.getParameters().size() < minParams) {
+                        simplestConstructor = constructor;
+                        minParams = constructor.getParameters().size();
+                    }
+                }
+
+                if (simplestConstructor != null && minParams <= 6) { // Allow up to 6 parameters
+                    // System.out.println("[DEBUG] Found constructor with " + minParams + "
+                    // parameters for: " + typeName);
+
+                    CtConstructorCall<?> call = factory.createConstructorCall();
+                    call.setType((CtTypeReference) paramType.clone());
+
+                    List<CtExpression<?>> args = new ArrayList<>();
+                    for (CtParameter<?> param : simplestConstructor.getParameters()) {
+                        CtTypeReference<?> paramTypeInner = param.getType();
+
+                        // Use a very simple strategy here - just use basic defaults
+                        CtExpression<?> arg = createBasicDefault(paramTypeInner, factory);
+                        args.add(arg);
+                    }
+
+                    call.setArguments(args);
+                    // System.out.println("[DEBUG] Force created constructor call: " +
+                    // call.toString());
+                    return call;
+                }
+            }
+        } catch (Exception e) {
+            // System.out.println("[DEBUG] Force creation failed: " + e.getMessage());
+        }
+
+        // 8. Final fallback to null
+        // System.out.println("[DEBUG] Final fallback to null for: " + typeName);
+        return SeedAugmentor.makeTypedNull(factory, paramType);
+    }
+
+    /**
+     * Create primitive default values with configurable string value and complex type handling
+     */
+    private static CtExpression<?> createPrimitiveDefault(CtTypeReference<?> paramType, Factory factory, 
+            String stringDefault, boolean handleComplexTypes) {
+        if (paramType == null) {
+            return factory.createLiteral(null);
+        }
+
+        String typeName = paramType.getQualifiedName();
+
+        // Handle primitive types and wrappers
+        switch (typeName) {
+            case "java.lang.String":
+                return factory.createLiteral(stringDefault);
+            case "int":
+            case "java.lang.Integer":
+                return factory.createLiteral(0);
+            case "long":
+            case "java.lang.Long":
+                return factory.createLiteral(0L);
+            case "double":
+            case "java.lang.Double":
+                return factory.createLiteral(0.0);
+            case "float":
+            case "java.lang.Float":
+                return factory.createLiteral(0.0f);
+            case "boolean":
+            case "java.lang.Boolean":
+                return factory.createLiteral(false);
+            case "char":
+            case "java.lang.Character":
+                return factory.createLiteral('a');
+            case "short":
+            case "java.lang.Short":
+                return factory.createLiteral((short) 0);
+            case "byte":
+            case "java.lang.Byte":
+                return factory.createLiteral((byte) 0);
+            case "java.lang.Comparable":
+                return factory.createLiteral("comparable");
+            default:
+                return handleComplexTypes ? null : factory.createLiteral(null);
+        }
+    }
+
+    /**
+     * Create very basic default values for force creation
+     */
+    private static CtExpression<?> createBasicDefault(CtTypeReference<?> paramType, Factory factory) {
+        return createPrimitiveDefault(paramType, factory, "default", false);
+    }
+
+    public static CtExpression<?> makeTypedNull(Factory factory, CtTypeReference<?> targetType) {
+        if (targetType == null || targetType.isPrimitive()) {
+            return factory.createLiteral(null);
+        }
+        CtLiteral<?> nl = factory.createLiteral(null);
+        nl.addTypeCast((CtTypeReference) targetType.clone());
+        return nl;
+    }
+
+    /**
+     * Create common implementations for well-known interface types
+     */
+    private static CtExpression<?> createCommonImplementation(CtTypeReference<?> paramType, Factory factory,
+            int depth) {
+        String typeName = paramType.getQualifiedName();
+
+        switch (typeName) {
+            case "java.lang.Comparable":
+                return factory.createLiteral("comparable");
+            case "java.awt.Paint":
+                // Create Color.BLACK as a Paint implementation
+                CtConstructorCall<?> colorCall = factory.createConstructorCall();
+                colorCall.setType(factory.createTypeReference().setSimpleName("Color"));
+                // Color(int r, int g, int b)
+                colorCall.setArguments(Arrays.asList(
+                        factory.createLiteral(0),
+                        factory.createLiteral(0),
+                        factory.createLiteral(0)));
+                return colorCall;
+            case "java.awt.Stroke":
+                // Create new BasicStroke()
+                CtConstructorCall<?> basicStroke = factory.createConstructorCall();
+                basicStroke.setType(factory.createTypeReference().setSimpleName("BasicStroke"));
+                return basicStroke;
+            case "org.jfree.chart.labels.CategoryItemLabelGenerator":
+                CtConstructorCall<?> labelGen = factory.createConstructorCall();
+                labelGen.setType(factory.createTypeReference().setSimpleName("StandardCategoryItemLabelGenerator"));
+                return labelGen;
+            case "org.jfree.chart.labels.CategoryToolTipGenerator":
+                CtConstructorCall<?> tooltipGen = factory.createConstructorCall();
+                tooltipGen.setType(factory.createTypeReference().setSimpleName("StandardCategoryToolTipGenerator"));
+                return tooltipGen;
+            case "org.jfree.chart.urls.CategoryURLGenerator":
+                CtConstructorCall<?> urlGen = factory.createConstructorCall();
+                urlGen.setType(factory.createTypeReference().setSimpleName("StandardCategoryURLGenerator"));
+                return urlGen;
+            case "org.jfree.chart.axis.ValueAxis":
+                CtConstructorCall<?> valueAxis = factory.createConstructorCall();
+                valueAxis.setType(factory.createTypeReference().setSimpleName("NumberAxis"));
+                valueAxis.setArguments(Arrays.asList(factory.createLiteral("axis")));
+                return valueAxis;
+            case "org.jfree.chart.plot.Marker":
+                CtConstructorCall<?> marker = factory.createConstructorCall();
+                marker.setType(factory.createTypeReference().setSimpleName("ValueMarker"));
+                marker.setArguments(Arrays.asList(factory.createLiteral(0.0)));
+                return marker;
+            case "java.util.List":
+                CtConstructorCall<?> arrayList = factory.createConstructorCall();
+                arrayList.setType(factory.createTypeReference().setSimpleName("ArrayList"));
+                return arrayList;
+            case "java.util.Map":
+                CtConstructorCall<?> hashMap = factory.createConstructorCall();
+                hashMap.setType(factory.createTypeReference().setSimpleName("HashMap"));
+                return hashMap;
+            case "java.util.Set":
+                CtConstructorCall<?> hashSet = factory.createConstructorCall();
+                hashSet.setType(factory.createTypeReference().setSimpleName("HashSet"));
+                return hashSet;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Try to create object via constructor
+     */
+    private static CtExpression<?> tryCreateViaConstructor(CtTypeReference<?> paramType, Factory factory, int depth) {
+        // Check if the type can be instantiated
+        if (!isInstantiable(paramType)) {
+            return null;
+        }
+
+        try {
+            Map<String, Set<CtConstructor<?>>> constructorsMap = ASTParser.getAll_Constructors_Map();
+            Set<CtConstructor<?>> constructors = constructorsMap.get(paramType.getQualifiedName());
+
+            if (constructors != null) {
+                // Sort by parameter count (prefer simpler constructors)
+                List<CtConstructor<?>> sortedConstructors = new ArrayList<>(constructors);
+                sortedConstructors.sort(Comparator.comparingInt(c -> c.getParameters().size()));
+
+                for (CtConstructor<?> constructor : sortedConstructors) {
+                    if (constructor.isPublic() && constructor.getParameters().size() <= 3) { // Limit complexity
+                        CtConstructorCall<?> call = createBasicConstructorCall(factory, paramType);
+                        
+                        List<CtExpression<?>> args = generateSimpleArgumentsForParameters(
+                            constructor.getParameters(), factory, depth + 1);
+                        
+                        if (areAllArgumentsValid(args)) {
+                            call.setArguments(args);
+                            return call;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Continue to next strategy
+        }
+        return null;
+    }
+
+    /**
+     * Try to create object via factory method
+     */
+    private static CtExpression<?> tryCreateViaFactoryMethod(CtTypeReference<?> paramType, Factory factory, int depth) {
+        try {
+            HashMap<String, Set<CtMethod<?>>> allMethodsMap = ASTParser.getAllMethods();
+            Set<CtMethod<?>> methods = allMethodsMap.get(paramType.getQualifiedName());
+
+            if (methods != null) {
+                for (CtMethod<?> method : methods) {
+                    if (method.hasModifier(ModifierKind.STATIC) &&
+                            method.isPublic() &&
+                            isFactoryMethodName(method.getSimpleName()) &&
+                            method.getParameters().size() <= 2) { // Limit complexity
+
+                        CtInvocation<?> invocation = factory.createInvocation();
+                        invocation.setExecutable((CtExecutableReference) method.getReference());
+
+                        // Set target to the class
+                        CtTypeAccess<?> typeAccess = factory.createTypeAccess();
+                        typeAccess.setAccessedType((CtTypeReference) method.getDeclaringType().getReference());
+                        invocation.setTarget(typeAccess);
+
+                        List<CtExpression<?>> args = new ArrayList<>();
+                        boolean canCreate = true;
+
+                        for (CtParameter<?> param : method.getParameters()) {
+                            CtExpression<?> arg = createSimpleArgumentWithDepth(param.getType(), factory, depth + 1);
+                            if (arg == null) {
+                                canCreate = false;
+                                break;
+                            }
+                            args.add(arg);
+                        }
+
+                        if (canCreate) {
+                            invocation.setArguments(args);
+                            return invocation;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Continue to fallback
+        }
+        return null;
+    }
+
+    // SeedAugmentor.java
+    // seqc/SeedAugmentor.java
+
+    private static CtConstructorCall<?> createConstructorCallFromConstructor(CtConstructor<?> constructor,
+            Factory factory, CtBlock<?> body, int currentDepth, CtTypeReference<?> typeRef) {
+        List<CtExpression<?>> args = new ArrayList<>();
+        CtConstructorCall<?> constructorCall = createBasicConstructorCall(factory, typeRef);
+
+
+        for (CtParameter<?> param : constructor.getParameters()) {
+            CtTypeReference<?> paramType = param.getType();
+            CtExpression<?> paramInitExpr = handleDummyParameterVals(paramType, body, factory, currentDepth + 1);
+
+            // --- START: 안정성 검사 (기존과 동일) ---
+            if (paramInitExpr != null && paramInitExpr.getType() != null
+                    && !paramInitExpr.getType().isSubtypeOf(paramType)) {
+                paramInitExpr = null;
+            }
+            // --- END: 안정성 검사 ---
+
+            // --- [핵심 수정: 실패 조건 완화 및 간단한 기본값 제공] ---
+            if (paramInitExpr == null ||
+                    (isNullLiteral(paramInitExpr) && !paramType.getQualifiedName().equals("java.lang.Object"))) {
+                // Try to create a simple default value for the parameter
+                CtExpression<?> simpleDefault = createSimpleArgument(paramType, factory);
+                args.add(simpleDefault);
+                continue; // 다음 파라미터로 계속 진행합니다.
+            }
+            // --- [수정 끝] ---
+
+            if (isLiteral(paramType) || usedInputPool) {
+                args.add(paramInitExpr);
+                usedInputPool = false;
+            } else {
+                String argVarName = "mockUp_" + System.currentTimeMillis() + "_" + dummyVarCounter++;
+                CtLocalVariable<?> localVar = factory.createLocalVariable();
+                localVar.setSimpleName(argVarName);
+                localVar.setType((CtTypeReference) paramType.clone());
+                localVar.setDefaultExpression((CtExpression) paramInitExpr);
+                body.addStatement(localVar);
+
+                CtVariableRead<?> varRead = factory.createVariableRead();
+                varRead.setVariable((CtVariableReference) localVar.getReference());
+                args.add(varRead);
+            }
+        }
+        constructorCall.setArguments(args);
+        
+        
+        return constructorCall;
+    }
+
+    private static CtMethod<?> findMatchingMethod(CtTypeReference<?> typeRef, Factory factory) {
+        String typeName = typeRef.getQualifiedName();
+
+        // Use cached methods list if available
+        List<CtMethod<?>> cachedMethods = allMethodCache.get(typeName);
+        if (cachedMethods == null) {
+            cachedMethods = buildAllMethodCache(typeRef);
+            allMethodCache.put(typeName, cachedMethods);
+        }
+
+        if (cachedMethods.isEmpty()) {
+            return null;
+        }
+
+        // Try factory methods first (they're sorted at the front)
+        Random rand = new Random();
+        int factoryMethodCount = 0;
+
+        // Count factory methods at the front of the list
+        for (CtMethod<?> method : cachedMethods) {
+            if (method.hasModifier(ModifierKind.STATIC) &&
+                    method.getType() != null &&
+                    isFactoryMethodName(method.getSimpleName()) &&
+                    isCompatibleTypeCached(method.getType(), typeRef)) {
+                factoryMethodCount++;
+            } else {
+                break; // Factory methods are at the front, so we can break
+            }
+        }
+
+        // Prefer factory methods (70% chance if available)
+        if (factoryMethodCount > 0 && rand.nextDouble() < 0.7) {
+            return cachedMethods.get(0); // Return highest priority factory method
+        }
+
+        // Fall back to any cached method
+        return cachedMethods.get(rand.nextInt(cachedMethods.size()));
+    }
+
+    /**
+     * Build and cache sorted method list for a type
+     */
+    private static List<CtMethod<?>> buildAllMethodCache(CtTypeReference<?> typeRef) {
+        HashMap<String, Set<CtMethod<?>>> allMethodsMap = ASTParser.getAllMethods();
+        Set<CtMethod<?>> methods = allMethodsMap.get(typeRef.getQualifiedName());
+
+        if (methods == null || methods.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<CtMethod<?>> factoryMethods = new ArrayList<>();
+        List<CtMethod<?>> otherMethods = new ArrayList<>();
+
+        for (CtMethod<?> method : methods) {
+            // Must be static and return compatible type for factory methods
+            if (method.hasModifier(ModifierKind.STATIC) &&
+                    method.getType() != null &&
+                    isCompatibleTypeCached(method.getType(), typeRef) &&
+                    isFactoryMethodName(method.getSimpleName())) {
+                factoryMethods.add(method);
+            } else {
+                otherMethods.add(method);
+            }
+        }
+
+        // Sort factory methods by priority
+        factoryMethods.sort((m1, m2) -> {
+            int paramDiff = m1.getParameters().size() - m2.getParameters().size();
+            if (paramDiff != 0) {
+                return paramDiff;
+            }
+
+            String name1 = m1.getSimpleName();
+            String name2 = m2.getSimpleName();
+            int priority1 = getFactoryMethodPriority(name1);
+            int priority2 = getFactoryMethodPriority(name2);
+            return priority1 - priority2;
+        });
+
+        // Combine lists with factory methods first
+        List<CtMethod<?>> result = new ArrayList<>(factoryMethods.size() + otherMethods.size());
+        result.addAll(factoryMethods);
+        result.addAll(otherMethods);
+
+        return result;
+    }
+
+    private static CtInvocation<?> createMethodInvo(CtMethod<?> selectedMethod, Factory factory, CtBlock<?> body,
+            int currentDepth) {
+        CtInvocation<?> methodCall = factory.createInvocation();
+        methodCall.setExecutable((CtExecutableReference) selectedMethod.getReference());
+        // ... (메소드 상단 Target 설정 로직은 동일) ...
+        if (selectedMethod.hasModifier(ModifierKind.STATIC)) {
+            CtTypeAccess<?> typeAccess = factory.createTypeAccess();
+            typeAccess.setAccessedType((CtTypeReference) selectedMethod.getDeclaringType().getReference());
+            methodCall.setTarget(typeAccess);
+        } else {
+            // non-static 메소드는 receiver 객체가 필요함
+            // receiver type이 접근 가능한 생성자를 가지고 있는지 확인
+            CtTypeReference<?> receiverType = selectedMethod.getDeclaringType().getReference();
+            if (!hasAccessibleConstructor(receiverType)) {
+                // receiver를 만들 수 없으면 이 메소드를 포기
+                return null;
+            }
+
+            CtExpression<?> instance = createDefaultExpressionForType(receiverType,
+                    factory, body, currentDepth);
+
+            // instance 생성 실패 시 메소드 포기
+            if (instance == null || isNullLiteral(instance)) {
+                return null;
+            }
+
+            methodCall.setTarget(instance);
+        }
+
+        List<CtExpression<?>> args = new ArrayList<>();
+
+        for (CtParameter<?> param : selectedMethod.getParameters()) {
+            CtTypeReference<?> paramType = param.getType();
+            CtExpression<?> paramInitExpr = handleDummyParameterVals(paramType, body, factory, currentDepth + 1);
+
+            // --- START: 최종 안정성 검사 ---
+            if (paramInitExpr != null && paramInitExpr.getType() != null
+                    && !paramInitExpr.getType().isSubtypeOf(paramType)) {
+                paramInitExpr = null;
+            }
+            // --- END: 최종 안정성 검사 ---
+
+            if (isLiteral(paramType)) {
+                args.add(paramInitExpr);
+            } else if (usedInputPool) {
+                args.add(paramInitExpr);
+                usedInputPool = false;
+            } else {
+                // paramInitExpr가 null일 경우를 대비한 방어 코드
+                if (paramInitExpr == null) {
+                    // Try to create a simple default value for the parameter
+                    CtExpression<?> simpleDefault = createSimpleArgument(paramType, factory);
+                    args.add(simpleDefault);
+                    continue;
+                }
+                String argVarName = "mockUp_" + System.currentTimeMillis() + "_" + dummyVarCounter++;
+
+                CtLocalVariable<?> localVar = factory.createLocalVariable();
+                localVar.setSimpleName(argVarName);
+                localVar.setType((CtTypeReference) paramType);
+                localVar.setDefaultExpression((CtExpression) paramInitExpr);
+                body.addStatement(localVar);
+
+                CtVariableRead<?> varRead = factory.createVariableRead();
+                varRead.setVariable((CtVariableReference) localVar.getReference());
+                args.add(varRead);
+            }
+        }
+        methodCall.setArguments(args);
+        return methodCall;
+    }
+
+    /**
+     * UTILITY FUNCTIONS
+     */
+
+    /**
+     * Check if a type is accessible from the test package (must be public or same package)
+     */
+    private static boolean isTypeAccessible(CtTypeReference<?> typeRef) {
+        if (typeRef == null) {
+            return false;
+        }
+
+        // Get the actual type declaration
+        CtType<?> typeDecl = typeRef.getTypeDeclaration();
+        if (typeDecl == null) {
+            // Can't determine, assume it's accessible (might be from external library)
+            return true;
+        }
+
+        // Check if the type is public
+        if (typeDecl.isPublic()) {
+            return true;
+        }
+
+        // If not public, check if it's in the same package
+        String typePackage = (typeDecl.getPackage() != null)
+                ? typeDecl.getPackage().getQualifiedName()
+                : "";
+        String targetPackage = Config.PACKAGE;
+
+        return typePackage.equals(targetPackage);
+    }
+
+    /**
+     * Check if a type can be instantiated (not abstract, not interface)
+     */
+    private static boolean isInstantiable(CtTypeReference<?> typeRef) {
+        if (typeRef == null) {
+            return false;
+        }
+
+        // Interfaces cannot be instantiated
+        if (typeRef.isInterface()) {
+            return false;
+        }
+
+        // Get the actual type declaration
+        CtType<?> typeDecl = typeRef.getTypeDeclaration();
+        if (typeDecl == null) {
+            // Can't determine, assume it's instantiable (might be from external library)
+            return true;
+        }
+
+        // Abstract classes cannot be instantiated
+        if (typeDecl.isAbstract()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Check if a type has at least one accessible constructor
+     */
+    private static boolean hasAccessibleConstructor(CtTypeReference<?> typeRef) {
+        Map<String, Set<CtConstructor<?>>> constructorsMap = ASTParser.getAll_Constructors_Map();
+        Set<CtConstructor<?>> constructors = constructorsMap.get(typeRef.getQualifiedName());
+
+        if (constructors == null || constructors.isEmpty()) {
+            return false;
+        }
+
+        String targetPackage = Config.PACKAGE;
+        for (CtConstructor<?> constructor : constructors) {
+            String constructorPackage = (constructor.getDeclaringType().getPackage() != null)
+                    ? constructor.getDeclaringType().getPackage().getQualifiedName()
+                    : "";
+
+            // private이 아니고, public이거나 같은 패키지면 접근 가능
+            boolean isAccessible = !constructor.isPrivate() && (constructor.isPublic() || constructorPackage.equals(targetPackage));
+            if (isAccessible) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static CtConstructor<?> findMatchingConstructor(CtTypeReference<?> typeRef, Factory factory) {
+        // Retrieve the map of constructors from ASTParser
+        Map<String, Set<CtConstructor<?>>> constructorsMap = ASTParser.getAll_Constructors_Map();
+
+        // Get the set of constructors for the exact type using its qualified name
+        Set<CtConstructor<?>> constructors = constructorsMap.get(typeRef.getQualifiedName());
+        if (constructors == null || constructors.isEmpty()) {
+            return null; // No constructors available for this type
+        }
+
+        // Filter out private constructors
+        String targetPackage = Config.PACKAGE;
+        Set<CtConstructor<?>> accessibleConstructors = new HashSet<>();
+        for (CtConstructor<?> constructor : constructors) {
+            String constructorPackage = (constructor.getDeclaringType().getPackage() != null)
+                    ? constructor.getDeclaringType().getPackage().getQualifiedName()
+                    : "";
+
+            // private이 아니고, public이거나 같은 패키지면 허용
+            boolean isAccessible = !constructor.isPrivate() && (constructor.isPublic() || constructorPackage.equals(targetPackage));
+            if (isAccessible) {
+                accessibleConstructors.add(constructor);
+            }
+        }
+
+        // No accessible constructors
+        if (accessibleConstructors.isEmpty()) {
+            return null;
+        }
+
+        // Get or initialize the set of generated constructors for this type
+        Set<CtConstructor<?>> generated = generatedConstructors.computeIfAbsent(typeRef, k -> new HashSet<>());
+
+        // Find constructors that haven't been generated yet
+        Set<CtConstructor<?>> available = new HashSet<>(accessibleConstructors);
+        available.removeAll(generated);
+
+        // Select a constructor
+        CtConstructor<?> selected;
+        Random rand = new Random();
+        if (!available.isEmpty()) {
+            // If there are unused constructors, select one randomly from them
+            List<CtConstructor<?>> availableList = new ArrayList<>(available);
+            selected = availableList.get(rand.nextInt(availableList.size()));
+        } else {
+            // If all constructors have been used, select one randomly from all accessible constructors
+            List<CtConstructor<?>> constructorsList = new ArrayList<>(accessibleConstructors);
+            selected = constructorsList.get(rand.nextInt(constructorsList.size()));
+        }
+
+        // Mark the selected constructor as generated
+        generated.add(selected);
+
+        return selected;
+    }
+
+    private static CtElement pickRandomPrim(CtTypeReference<?> typeRef) {
+        if (isLiteral(typeRef)) {
+            List<CtElement> reusablePrimList = baseDirectToValuesAsList.get(typeRef);
+
+            if (reusablePrimList != null && !reusablePrimList.isEmpty()) {
+
+                List<CtElement> validCandidates = new ArrayList<>();
+                for (CtElement prim : reusablePrimList) {
+                    boolean allMatch = prim.getReferencedTypes().stream()
+                            .allMatch(tmp -> tmp.equals(typeRef));
+                    if (allMatch) {
+                        validCandidates.add(prim);
+                    }
+                }
+
+                if (!validCandidates.isEmpty()) {
+                    return validCandidates.get(rand.nextInt(validCandidates.size()));
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean isAssignableFrom(CtTypeReference<?> superType, CtTypeReference<?> subType, Factory factory) {
+        if (superType.equals(subType)) {
+            return true;
+        }
+
+        CtType<?> subTypeDecl = subType.getTypeDeclaration();
+        if (subTypeDecl == null) {
+            return false; // 선언이 없으면 확인 불가
+        }
+
+        // 상위 클래스 확인
+        CtTypeReference<?> superClass = subTypeDecl.getSuperclass();
+        while (superClass != null) {
+            if (superClass.equals(superType)) {
+                return true;
+            }
+            superClass = superClass.getTypeDeclaration() != null ? superClass.getTypeDeclaration().getSuperclass()
+                    : null;
+        }
+
+        // 인터페이스 확인
+        Set<CtTypeReference<?>> interfaces = subTypeDecl.getSuperInterfaces();
+        for (CtTypeReference<?> iface : interfaces) {
+            if (iface.equals(superType) || isAssignableFrom(superType, iface, factory)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void addInputStatementsToBody(List<CtElement> input, CtBlock<?> body) {
+        for (CtElement element : input) {
+            body.addStatement((CtStatement) element.clone());
+        }
+    }
+
+    private static boolean isAbstractClass(CtTypeReference<?> typeRef) {
+        return typeRef.getTypeDeclaration() != null && typeRef.getTypeDeclaration().isAbstract();
+    }
+
+    private static boolean isLiteral(CtTypeReference<?> type) {
+        if (type.isPrimitive() || type.getQualifiedName().equals("java.lang.String"))
+            return true;
+        return false;
+    }
+
+    private static boolean isStatic(CtMethod<?> method) {
+        return method.getModifiers().contains(ModifierKind.STATIC);
+    }
+
+    /**
+     * Helper method to check if an expression is a null literal
+     */
+    private static boolean isNullLiteral(CtExpression<?> expr) {
+        return expr instanceof CtLiteral && ((CtLiteral<?>) expr).getValue() == null;
+    }
+
+    /**
+     * Helper method to check if an expression is valid (not null and not a null literal)
+     */
+    private static boolean isValidNonNullExpression(CtExpression<?> expr) {
+        return expr != null && !isNullLiteral(expr) && !isConstructorWithAllNullArgs(expr);
+    }
+
+    /**
+     * Check if expression is a constructor call with all arguments being null literals
+     */
+    private static boolean isConstructorWithAllNullArgs(CtExpression<?> expr) {
+        if (!(expr instanceof CtConstructorCall)) {
+            return false;
+        }
+
+        CtConstructorCall<?> constructorCall = (CtConstructorCall<?>) expr;
+        List<CtExpression<?>> args = constructorCall.getArguments();
+
+        // If no arguments, it's not "all null"
+        if (args == null || args.isEmpty()) {
+            return false;
+        }
+
+        // Check if ALL arguments are null literals (cast or not)
+        for (CtExpression<?> arg : args) {
+            if (!isNullOrCastedNull(arg)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Check if expression is null or a casted null like ((Type) (null))
+     */
+    private static boolean isNullOrCastedNull(CtExpression<?> expr) {
+        if (expr == null) {
+            return true;
+        }
+
+        // Direct null literal
+        if (isNullLiteral(expr)) {
+            return true;
+        }
+
+        // Check for type cast with null value
+        // Pattern: ((Type) (null)) or ((Type) null)
+        String exprStr = expr.toString().trim();
+
+        // More precise pattern: starts with (( and contains null
+        // This checks if the entire expression is a casted null, not just contains null somewhere
+        if (exprStr.startsWith("((") && exprStr.endsWith("))")) {
+            // Extract the content between outer parentheses
+            String content = exprStr.substring(2, exprStr.length() - 2).trim();
+
+            // Check if it's a type cast: (Type) (null) or (Type) null
+            if (content.matches(".*\\)\\s*\\(?\\s*null\\s*\\)?$")) {
+                return true;
+            }
+        }
+
+        // Also check simpler pattern: (Type) null without extra parentheses
+        if (exprStr.matches("\\(.*\\)\\s*null")) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Helper method to normalize type name for variable naming
+     */
+    private static String normalizeTypeNameForVariable(CtTypeReference<?> type) {
+        return type.getSimpleName().toLowerCase().replace("[", "").replace("]", "");
+    }
+
+    /**
+     * Create a basic constructor call with type set
+     */
+    private static CtConstructorCall<?> createBasicConstructorCall(Factory factory, CtTypeReference<?> type) {
+        CtConstructorCall<?> constructorCall = factory.createConstructorCall();
+        constructorCall.setType((CtTypeReference) type.clone());
+        return constructorCall;
+    }
+
+    /**
+     * Generate arguments for constructor/method parameters with fallback handling
+     */
+    private static List<CtExpression<?>> generateArgumentsWithFallback(List<CtParameter<?>> parameters, 
+            Factory factory, CtBlock<?> body, int currentDepth, boolean useSimpleFallback) {
+        
+        List<CtExpression<?>> args = new ArrayList<>();
+        
+        for (CtParameter<?> param : parameters) {
+            CtTypeReference<?> paramType = param.getType();
+            CtExpression<?> argExpr = null;
+            
+            if (useSimpleFallback) {
+                argExpr = createSimpleArgument(paramType, factory);
+            } else {
+                argExpr = handleDummyParameterVals(paramType, body, factory, currentDepth + 1);
+                
+                // Type safety check
+                if (argExpr != null && argExpr.getType() != null 
+                        && !argExpr.getType().isSubtypeOf(paramType)) {
+                    argExpr = null;
+                }
+                
+                // Fallback for failed arguments
+                if (argExpr == null || 
+                        (isNullLiteral(argExpr) && !paramType.getQualifiedName().equals("java.lang.Object"))) {
+                    argExpr = createSimpleArgument(paramType, factory);
+                }
+            }
+            
+            args.add(argExpr);
+        }
+        
+        return args;
+    }
+
+    /**
+     * Check if all arguments in list are valid (non-null, non-null-literal)
+     */
+    private static boolean areAllArgumentsValid(List<CtExpression<?>> args) {
+        return args.stream().allMatch(arg -> isValidNonNullExpression(arg));
+    }
+
+    /**
+     * Generate simple arguments for parameters with depth control
+     */
+    private static List<CtExpression<?>> generateSimpleArgumentsForParameters(List<CtParameter<?>> parameters,
+            Factory factory, int depth) {
+        List<CtExpression<?>> args = new ArrayList<>();
+        
+        for (CtParameter<?> param : parameters) {
+            CtExpression<?> arg = createSimpleArgumentWithDepth(param.getType(), factory, depth);
+            args.add(arg);
+        }
+        
+        return args;
+    }
+
+    /**
+     * SETUP FUNCTIONS
+     */
+
+    private static List<String> findOutNeglectedMUTS() {
+        List<String> ret = new ArrayList<>();
+        Set<String> CUT_PublicMethods = ASTParser.getCUT_PublicMethods();
+        List<String> baseMUTSignatures = getBaseMUTSignature();
+
+        if (CUT_PublicMethods.isEmpty()) {
+            return ret;
+        }
+        Set<String> baseMUTSet = new HashSet<>(baseMUTSignatures);
+        // System.out.println("Size of Base MUT SET : " + baseMUTSet.size());
+        for (String CUT_PublicMethod : CUT_PublicMethods) {
+            // System.out.println("AUG SIG :" + CUT_PublicMethod);
+            if (!baseMUTSet.contains(CUT_PublicMethod)) {
+                ret.add(CUT_PublicMethod);
+            }
+        }
+        return ret;
+    }
+
+    private static List<String> getBaseMUTSignature() {
+        Set<MUTInput> temp = InputCombinations.getMuts();
+        if (temp == null) {
+            return new ArrayList<>();
+        }
+        List<String> baseMUTSignatures = new ArrayList<>();
+        for (MUTInput mut : temp) {
+            // System.out.println("MUT SIG : " + mut.getMethodSignature());
+            baseMUTSignatures.add(mut.getMethodSignature());
+        }
+        return baseMUTSignatures;
+    }
+
+    // =================================================================
+    // RETRY FAILED MUTs AND NULL OBJECT GENERATION METHODS
+    // =================================================================
+    
+    /**
+     * Retry failed MUTs with seed augmentation by generating dummy test methods for specific types
+     */
+    public static void retryFailedMUTsWithSeedAugmentation(InputCombinations inputCombinations) throws Exception {
+        Set<InputCombinations.FailedMUT> failedMUTs = inputCombinations.getFailedMUTs();
+        
+        if (failedMUTs.isEmpty()) {
+            System.out.println("[INFO] No failed MUTs to retry with seed augmentation.");
+            return;
+        }
+        
+        int maxRetryAttempts = 2;
+        
+        for (int attempt = 1; attempt <= maxRetryAttempts; attempt++) {
+            Set<InputCombinations.FailedMUT> currentBatchFailures = new HashSet<>(failedMUTs);
+            failedMUTs.clear(); // Clear for this attempt
+            
+            if (currentBatchFailures.isEmpty()) {
+                break; // No more failed MUTs to retry
+            }
+            
+            // Generate dummy test methods for the specific failed types
+            generateDummyTestsForFailedTypes(currentBatchFailures);
+            
+            // Reprocess the failed MUTs
+            Set<MUTInput> newMUTs = inputCombinations.retryFailedMUTs(currentBatchFailures);
+            
+            if (newMUTs != null && !newMUTs.isEmpty()) {
+                inputCombinations.addMUTs(newMUTs);
+            }
+            
+            // If no more failures in this attempt, break
+            if (failedMUTs.isEmpty()) {
+                break;
+            }
+        }
+        
+        if (!failedMUTs.isEmpty()) {
+            System.out.println("[WARN] " + failedMUTs.size() + " MUTs could not be recovered after " + maxRetryAttempts + " attempts.");
+        }
+    }
+    
+    /**
+     * Generate dummy test methods specifically for the failed types - one constructor per test
+     */
+    private static void generateDummyTestsForFailedTypes(Set<InputCombinations.FailedMUT> currentFailures) throws Exception {
+        if (factory == null) {
+            factory = new Launcher().getFactory();
+        }
+        
+        List<CtMethod<?>> generatedDummyMethods = new ArrayList<>();
+        
+        // Track processed constructor signatures to avoid duplicates
+        Set<String> processedConstructorSignatures = new HashSet<>();
+        
+        // Group failed MUTs by their failed types
+        Map<String, List<InputCombinations.FailedMUT>> failuresByType = new HashMap<>();
+        for (InputCombinations.FailedMUT failure : currentFailures) {
+            String typeName = failure.getFailedType().getQualifiedName();
+            failuresByType.computeIfAbsent(typeName, k -> new ArrayList<>()).add(failure);
+        }
+        
+        for (Map.Entry<String, List<InputCombinations.FailedMUT>> entry : failuresByType.entrySet()) {
+            String typeName = entry.getKey();
+            List<InputCombinations.FailedMUT> failuresForType = entry.getValue();
+            CtTypeReference<?> targetType = failuresForType.get(0).getFailedType();
+
+            // Skip if variants were already generated for this type
+            if (variantsGeneratedTypes.contains(typeName)) {
+                System.out.println("[INFO] Skipping retry for " + typeName + " - variants already generated");
+                continue;
+            }
+
+            // Generate separate tests for each constructor of this type
+            List<CtMethod<?>> constructorTests = generateOneTestPerConstructor(factory, targetType, processedConstructorSignatures);
+            generatedDummyMethods.addAll(constructorTests);
+
+            // Also generate tests for concrete implementations if this is an abstract type
+            List<CtTypeReference<?>> implementations = ASTParser.abstractToImplsMap.get(typeName);
+            if (implementations != null && !implementations.isEmpty()) {
+                // Don't generate implementation tests if we already have variants for this abstract type
+                System.out.println("[INFO] Skipping implementation tests for " + typeName + " - trying direct constructor tests only");
+            }
+        }
+        
+        // Parse the generated dummy methods to populate the input pools
+        for (CtMethod<?> dummyMethod : generatedDummyMethods) {
+            try {
+                ASTParser.processDummyVartypeTovarnames(dummyMethod);
+            } catch (Exception e) {
+                System.err.println("[ERROR] Failed to parse dummy test method: " + dummyMethod.getSimpleName());
+                // e.printStackTrace();
+            }
+        }
+        
+        // System.out.println("[INFO] Generated " + generatedDummyMethods.size() + " dummy tests (one constructor per test)");
+    }
+    
+    /**
+     * Generate separate dummy test methods - one per constructor for the specified type
+     */
+    private static List<CtMethod<?>> generateOneTestPerConstructor(Factory factory, CtTypeReference<?> targetType, Set<String> processedSignatures) {
+        List<CtMethod<?>> constructorTests = new ArrayList<>();
+        
+        try {
+            // Try default constructor first
+            String defaultConstructorSig = targetType.getQualifiedName() + "()";
+            if (!processedSignatures.contains(defaultConstructorSig)) {
+                CtMethod<?> defaultConstructorTest = createSingleConstructorTest(factory, targetType, null, "default");
+                if (defaultConstructorTest != null) {
+                    constructorTests.add(defaultConstructorTest);
+                    processedSignatures.add(defaultConstructorSig);
+                }
+            }
+            
+            // Get all available constructors for this type
+            Map<String, Set<CtConstructor<?>>> constructorsMap = ASTParser.getAll_Constructors_Map();
+            Set<CtConstructor<?>> constructors = constructorsMap.get(targetType.getQualifiedName());
+            
+            if (constructors != null && !constructors.isEmpty()) {
+                // Sort constructors by parameter count to try simpler ones first
+                List<CtConstructor<?>> sortedConstructors = new ArrayList<>(constructors);
+                sortedConstructors.sort(Comparator.comparingInt(c -> c.getParameters().size()));
+                
+                int constructorIndex = 0;
+                for (CtConstructor<?> constructor : sortedConstructors) {
+                    // Create constructor signature
+                    StringBuilder sigBuilder = new StringBuilder(targetType.getQualifiedName() + "(");
+                    for (int i = 0; i < constructor.getParameters().size(); i++) {
+                        if (i > 0) sigBuilder.append(",");
+                        sigBuilder.append(constructor.getParameters().get(i).getType().getQualifiedName());
+                    }
+                    sigBuilder.append(")");
+                    String constructorSig = sigBuilder.toString();
+                    
+                    // Skip if we've already processed this constructor signature
+                    if (!processedSignatures.contains(constructorSig)) {
+                        CtMethod<?> constructorTest = createSingleConstructorTest(factory, targetType, constructor, "constructor" + constructorIndex);
+                        if (constructorTest != null) {
+                            constructorTests.add(constructorTest);
+                            processedSignatures.add(constructorSig);
+                            constructorIndex++;
+                        }
+                    }
+                }
+            }
+            
+        } catch (Exception e) {
+            System.err.println("[ERROR] Failed to generate constructor tests for type: " + targetType.getQualifiedName());
+            // e.printStackTrace();
+        }
+        
+        return constructorTests;
+    }
+    
+    /**
+     * Create a single dummy test method using one specific constructor
+     */
+    private static CtMethod<?> createSingleConstructorTest(Factory factory, CtTypeReference<?> targetType, CtConstructor<?> constructor, String constructorType) {
+        try {
+            CtMethod<Void> dummyTestMethod = factory.createMethod();
+            dummyTestMethod.setSimpleName("dummyTest" + targetType.getSimpleName() + "_" + constructorType + "_" + System.currentTimeMillis());
+            dummyTestMethod.setType(factory.Type().createReference(void.class));
+            CtBlock<?> body = factory.createBlock();
+            dummyTestMethod.setBody(body);
+            
+            // Create one instance using the specific constructor
+            createSingleInstanceWithConstructor(factory, body, targetType, constructor);
+            return dummyTestMethod;
+        } catch (Exception e) {
+            System.err.println("[ERROR] Failed to create single constructor test for: " + targetType.getQualifiedName());
+            return null;
+        }
+    }
+    
+    /**
+     * Create a single instance using a specific constructor
+     */
+    private static void createSingleInstanceWithConstructor(Factory factory, CtBlock<?> body, CtTypeReference<?> targetType, CtConstructor<?> constructor) {
+        // Check if the type can be instantiated
+        if (!isInstantiable(targetType)) {
+            System.err.println("[ERROR] Cannot instantiate abstract type: " + targetType.getQualifiedName());
+            return;
+        }
+
+        try {
+            // Try factory method first
+            CtInvocation<?> factoryCall = tryCreateFromFactoryMethod(targetType, factory, body, 0);
+            if (factoryCall != null) {
+                // Create var for the factory result
+                String typeSimpleName = normalizeTypeNameForVariable(targetType);
+                String varName = typeSimpleName + "_" + System.nanoTime() + "_" + (int)(Math.random() * 1000);
+                CtLocalVariable<?> var = factory.createLocalVariable();
+                var.setSimpleName(varName);
+                var.setType((CtTypeReference) targetType.clone());
+                var.setDefaultExpression((CtExpression) factoryCall);
+                body.addStatement(var);
+                return;
+            }
+
+            // Fallback to constructor
+            CtConstructorCall<?> constructorCall = factory.createConstructorCall();
+            constructorCall.setType((CtTypeReference) targetType.clone());
+            
+            // If no specific constructor, try default
+            if (constructor == null) {
+                constructorCall.setArguments(new ArrayList<>());
+            } else {
+                // Generate args using enhanced method
+                List<CtExpression<?>> args = new ArrayList<>();
+                for (CtParameter<?> param : constructor.getParameters()) {
+                    CtExpression<?> argExpr = createDefaultExpressionForType(param.getType(), factory, body, 0);
+                    // Type compatibility check
+                    if (argExpr != null && argExpr.getType() != null && 
+                        isCompatibleTypeCached(argExpr.getType(), param.getType())) {
+                        args.add(argExpr);
+                    } else {
+                        // If incompatible, fallback to null or simple arg
+                        args.add(createSimpleArgument(param.getType(), factory));
+                    }
+                }
+                constructorCall.setArguments(args);
+            }
+            
+            // Create var for the constructor result
+            String typeSimpleName = normalizeTypeNameForVariable(targetType);
+            String varName = typeSimpleName + "_" + System.nanoTime() + "_" + (int)(Math.random() * 1000);
+            CtLocalVariable<?> var = factory.createLocalVariable();
+            var.setSimpleName(varName);
+            var.setType((CtTypeReference) targetType.clone());
+            var.setDefaultExpression((CtExpression) constructorCall);
+            body.addStatement(var);
+            
+        } catch (Exception e) {
+            System.err.println("[ERROR] Failed to create instance with constructor for: " + targetType.getQualifiedName());
+        }
+    }
+    
+    /**
+     * Add null objects to the input pool for all types required by Public+Protected APIs
+     */
+    public static void addNullObjectsForPublicAPITypes() {
+        try {
+            HashMap<String, CtMethod<?>> publicAPIs = ASTParser.getCUT_PublicMethods_Map();
+            Set<CtTypeReference<?>> requiredTypes = new HashSet<>();
+            
+            // Collect all types required by Public+Protected APIs
+            for (CtMethod<?> method : publicAPIs.values()) {
+                boolean isStatic = method.getModifiers().contains(spoon.reflect.declaration.ModifierKind.STATIC);
+                
+                // Add receiver type for non-static methods
+                if (!isStatic) {
+                    requiredTypes.add(method.getDeclaringType().getReference());
+                }
+                
+                // Add parameter types
+                for (CtParameter<?> param : method.getParameters()) {
+                    CtTypeReference<?> paramType = param.getType();
+                    if (paramType != null && !paramType.isPrimitive()) {
+                        requiredTypes.add(paramType);
+                    }
+                }
+            }
+            
+            // System.out.println("[INFO] Adding null objects for " + requiredTypes.size() + " types required by Public APIs");
+            
+            if (factory == null) {
+                factory = new Launcher().getFactory();
+            }
+            int nullObjectsAdded = 0;
+            
+            for (CtTypeReference<?> type : requiredTypes) {
+                // Check if we already have a null object for this type using normalized declaration approach
+                String nullObjectSignature = createNullObjectSignature(type);
+                if (CandidatePool.isDeclarationProcessed(type, nullObjectSignature)) {
+                    continue;
+                }
+                
+                
+                // Try to create actual object via constructor instead of null
+                List<CtElement> objectSequence = tryCreateActualObjectSequence(type, factory);
+                
+                if (objectSequence != null && !objectSequence.isEmpty()) {
+                    // Successfully created actual object with complete sequence
+                    CtLocalVariable<?> objectVar = (CtLocalVariable<?>) objectSequence.get(objectSequence.size() - 1);
+                    CtElement varNameElement = objectVar.getReference();
+                    
+                    Pair<CtTypeReference, CtElement> typeAndName = new Pair<>(type, varNameElement);
+                    boolean inserted = CandidatePool.insertVarTypeToInputPool(typeAndName, objectSequence);
+                    
+                    if (inserted) {
+                        CandidatePool.addProcessedDeclaration(type, nullObjectSignature);
+                        nullObjectsAdded++;
+                    }
+
+                    // After successful constructor creation, also add a null object (separate from the 3 variants)
+                    if (!hasNullObjectInPool(type)) {
+                        String nullVarName = generateNullVarName(type);
+                        CtLocalVariable<?> nullVar = factory.createLocalVariable();
+                        nullVar.setSimpleName(nullVarName);
+                        nullVar.setType((CtTypeReference) type.clone());
+                        nullVar.setDefaultExpression(factory.createLiteral(null));
+
+                        // Insert null object into CandidatePool
+                        CtElement nullVarNameElement = nullVar.getReference();
+                        List<CtElement> nullStmts = new ArrayList<>();
+                        nullStmts.add(nullVar);
+
+                        Pair<CtTypeReference, CtElement> nullTypeAndName = new Pair<>(type, nullVarNameElement);
+                        boolean nullInserted = CandidatePool.insertVarTypeToInputPool(nullTypeAndName, nullStmts);
+
+                        if (nullInserted) {
+                            nullObjectsAdded++;
+                        }
+                    }
+                } else {
+                    // Fallback to null object if constructor creation fails
+                    String varName = generateNullVarName(type);
+                    CtLocalVariable<?> nullVar = factory.createLocalVariable();
+                    nullVar.setSimpleName(varName);
+                    nullVar.setType((CtTypeReference) type.clone());
+                    nullVar.setDefaultExpression(factory.createLiteral(null));
+
+                    // Insert into CandidatePool
+                    CtElement varNameElement = nullVar.getReference();
+                    List<CtElement> stmts = new ArrayList<>();
+                    stmts.add(nullVar);
+
+                    Pair<CtTypeReference, CtElement> typeAndName = new Pair<>(type, varNameElement);
+                    boolean inserted = CandidatePool.insertVarTypeToInputPool(typeAndName, stmts);
+
+                    if (inserted) {
+                        CandidatePool.addProcessedDeclaration(type, nullObjectSignature);
+                        nullObjectsAdded++;
+                    }
+                }
+            }
+            
+            // System.out.println("[INFO] Successfully added " + nullObjectsAdded + " null objects to the input pool");
+            
+        } catch (Exception e) {
+            System.err.println("[ERROR] Failed to add null objects for Public API types: " + e.getMessage());
+            // e.printStackTrace();
+        }
+    }
+    
+    
+    /**
+     * Generate a unique variable name for null object
+     */
+    private static String generateNullVarName(CtTypeReference<?> type) {
+        String typeSimpleName = normalizeTypeNameForVariable(type);
+        long timestamp = System.nanoTime();
+        int random = (int)(Math.random() * 1000);
+        return "null_" + typeSimpleName + "_" + timestamp + "_" + random;
+    }
+    
+    /**
+     * Create a normalized signature for null objects to prevent duplicates
+     * Similar to ASTParser.normalizeDeclaration but specifically for null objects
+     */
+    private static String createNullObjectSignature(CtTypeReference<?> type) {
+        return type.getQualifiedName() + " <VAR> = null";
+    }
+
+    /**
+     * Try to create an actual object via constructor with complete sequence
+     * Returns a list containing all necessary statements including parameter declarations
+     */
+    private static List<CtElement> tryCreateActualObjectSequence(CtTypeReference<?> type, Factory factory) {
+        try {
+            
+            // Create a temporary body for constructor creation
+            CtBlock<?> tempBody = factory.createBlock();
+            
+            // Try to create object via constructor - this will populate tempBody with necessary statements
+            CtExpression<?> constructorExpr = generateConcreteExpr(type, factory, tempBody, 0);
+            
+            if (constructorExpr != null && !isNullLiteral(constructorExpr)) {
+                // Successfully created a non-null object
+                String varName = generateActualVarName(type);
+                CtLocalVariable<?> objectVar = factory.createLocalVariable();
+                objectVar.setSimpleName(varName);
+                objectVar.setType((CtTypeReference) type.clone());
+                objectVar.setDefaultExpression((CtExpression) constructorExpr);
+                
+                // Create the complete sequence: all prerequisite statements + final variable declaration
+                List<CtElement> sequence = new ArrayList<>();
+                
+                // Add all statements from tempBody (these are the prerequisite variable declarations)
+                for (CtStatement stmt : tempBody.getStatements()) {
+                    sequence.add(stmt);
+                }
+                
+                // Add the final object variable declaration
+                sequence.add(objectVar);
+                
+                
+                return sequence;
+            }
+        } catch (Exception e) {
+            // Constructor creation failed, will fallback to null
+        }
+        
+        return null; // Failed to create actual object
+    }
+
+    /**
+     * Generate variable name for actual object (not null)
+     */
+    private static String generateActualVarName(CtTypeReference<?> type) {
+        String typeSimpleName = normalizeTypeNameForVariable(type);
+        return typeSimpleName.toLowerCase() + "_" + System.nanoTime() + "_" + (int)(Math.random() * 1000);
+    }
+
+    /**
+     * Check if the pool already has a null object for the given type
+     */
+    private static boolean hasNullObjectInPool(CtTypeReference<?> type) {
+        // Check in baseVarTypeNamePoolAsList if it exists
+        if (baseVarTypeNamePoolAsList != null) {
+            for (Map.Entry<CtTypeReference, List<Pair<CtTypeReference, CtElement>>> entry : baseVarTypeNamePoolAsList.entrySet()) {
+                CtTypeReference<?> poolType = entry.getKey();
+                if (isCompatibleType(poolType, type)) {
+                    List<Pair<CtTypeReference, CtElement>> candidates = entry.getValue();
+                    
+                    // Check if any candidate in the pool is a null object
+                    for (Pair<CtTypeReference, CtElement> candidate : candidates) {
+                        Set<List<CtElement>> sequences = baseVartypeToInputPool.get(candidate);
+                        if (sequences != null) {
+                            for (List<CtElement> sequence : sequences) {
+                                if (!sequence.isEmpty()) {
+                                    CtElement lastElement = sequence.get(sequence.size() - 1);
+                                    if (lastElement instanceof CtLocalVariable<?>) {
+                                        CtLocalVariable<?> var = (CtLocalVariable<?>) lastElement;
+                                        CtExpression<?> defaultExpr = var.getDefaultExpression();
+                                        
+                                        // If the variable is initialized with null, it's a null object
+                                        if (defaultExpr != null && isNullLiteral(defaultExpr)) {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break; // Found the type, no need to continue
+                }
+            }
+        }
+        return false; // No null object found for this type
+    }
+    
+    /**
+     * Augment String values in the direct pool with variations
+     * Only targets short strings (length <= 3) and randomly selects up to 10
+     */
+    public static void augmentStringDirectPool() {
+        try {
+            HashMap<CtTypeReference, Set<CtElement>> directToValues = CandidatePool.getDirectToValues();
+            
+            if (factory == null) {
+                factory = new Launcher().getFactory();
+            }
+            
+            int maxStringsToMutate = 10;
+            int stringVariationsAdded = 0;
+            
+            // Find String type reference
+            CtTypeReference<?> stringType = null;
+            for (CtTypeReference<?> type : directToValues.keySet()) {
+                if ("java.lang.String".equals(type.getQualifiedName())) {
+                    stringType = type;
+                    break;
+                }
+            }
+            
+            if (stringType == null) {
+                // System.out.println("[INFO] No String values found in direct pool for augmentation");
+                return;
+            }
+            
+            Set<CtElement> stringValues = directToValues.get(stringType);
+            
+            // Filter strings: prefer short strings (length <= 3), fallback to any strings
+            List<CtElement> shortStringCandidates = new ArrayList<>();
+            List<CtElement> allStringCandidates = new ArrayList<>();
+            
+            for (CtElement element : stringValues) {
+                if (element instanceof CtLiteral<?>) {
+                    CtLiteral<?> literal = (CtLiteral<?>) element;
+                    Object value = literal.getValue();
+                    
+                    if (value instanceof String && value != null && !((String) value).isEmpty()) {
+                        String str = (String) value;
+                        allStringCandidates.add(element);
+                        if (str.length() <= 3) {
+                            shortStringCandidates.add(element);
+                        }
+                    }
+                }
+            }
+            
+            // Select candidates: prefer short strings, fallback to any strings
+            List<CtElement> selectedCandidates;
+            int stringsToProcess;
+            
+            if (!shortStringCandidates.isEmpty()) {
+                Collections.shuffle(shortStringCandidates);
+                stringsToProcess = Math.min(maxStringsToMutate, shortStringCandidates.size());
+                selectedCandidates = shortStringCandidates.subList(0, stringsToProcess);
+                // System.out.println("[INFO] Found " + shortStringCandidates.size() + " short strings (≤3 chars), randomly selected " + stringsToProcess + " for augmentation");
+            } else if (!allStringCandidates.isEmpty()) {
+                Collections.shuffle(allStringCandidates);
+                stringsToProcess = Math.min(maxStringsToMutate, allStringCandidates.size());
+                selectedCandidates = allStringCandidates.subList(0, stringsToProcess);
+                // System.out.println("[INFO] No short strings found, randomly selected " + stringsToProcess + " from " + allStringCandidates.size() + " total strings for augmentation");
+            } else {
+                // System.out.println("[INFO] No non-empty strings found for augmentation");
+                return;
+            }
+            
+            Set<CtElement> newVariations = new HashSet<>();
+            
+            for (CtElement element : selectedCandidates) {
+                if (element instanceof CtLiteral<?>) {
+                    CtLiteral<?> literal = (CtLiteral<?>) element;
+                    Object value = literal.getValue();
+                    
+                    if (value instanceof String) {
+                        String originalString = (String) value;
+                        if (DEBUG_STRING_MUTATION) {
+                            System.out.println("[DEBUG] Mutating string: \"" + originalString + "\" (length: " + originalString.length() + ")");
+                        }
+                        
+                        List<String> variations = generateStringVariations(originalString);
+                        
+                        for (String variation : variations) {
+                            CtLiteral<String> newLiteral = factory.createLiteral(variation);
+                            newVariations.add(newLiteral);
+                            stringVariationsAdded++;
+                        }
+                    }
+                }
+            }
+            
+            // Add new variations to the direct pool
+            if (!newVariations.isEmpty()) {
+                stringValues.addAll(newVariations);
+                // System.out.println("[INFO] Added " + stringVariationsAdded + " String variations to direct pool");
+            }
+            
+        } catch (Exception e) {
+            System.err.println("[ERROR] Failed to augment String direct pool: " + e.getMessage());
+            // e.printStackTrace();
+        }
+    }
+    
+    // Static variable to store collected special characters (only collect once)
+    private static Set<Character> collectedSpecialChars = null;
+    
+    /**
+     * Extracts special characters (@, _) from directToValues strings
+     * Only collects once, then reuses the collected characters
+     * @return Set of special characters found in directToValues strings
+     */
+    private static Set<Character> getSpecialCharactersFromDirectToValues() {
+        if (collectedSpecialChars != null) {
+            return collectedSpecialChars; // Already collected, return cached result
+        }
+        
+        collectedSpecialChars = new HashSet<>();
+        
+        try {
+            HashMap<CtTypeReference, Set<CtElement>> directToValues = CandidatePool.getDirectToValues();
+            
+            // Find String type reference
+            CtTypeReference<?> stringType = null;
+            for (CtTypeReference<?> type : directToValues.keySet()) {
+                if ("java.lang.String".equals(type.getQualifiedName())) {
+                    stringType = type;
+                    break;
+                }
+            }
+            
+            if (stringType != null) {
+                Set<CtElement> stringElements = directToValues.get(stringType);
+                
+                for (CtElement element : stringElements) {
+                    if (element instanceof CtLiteral) {
+                        CtLiteral<?> literal = (CtLiteral<?>) element;
+                        Object value = literal.getValue();
+                        if (value instanceof String) {
+                            String str = (String) value;
+                            for (char c : str.toCharArray()) {
+                                if (c == '@' || c == '_' || c == '!' || c == '?') {
+                                    collectedSpecialChars.add(c);
+                                    // Early exit if we found both special characters
+                                    if (collectedSpecialChars.size() == 4) {
+                                        return collectedSpecialChars;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[ERROR] Failed to extract special characters from directToValues: " + e.getMessage());
+        }
+        
+        return collectedSpecialChars;
+    }
+    
+    /**
+     * Generate String variations optimized for short strings
+     */
+    private static List<String> generateStringVariations(String original) {
+        List<String> variations = new ArrayList<>();
+        
+        if (original == null) {
+            return variations;
+        }
+        
+        // Random single character case toggle for all strings
+        if (!original.isEmpty()) {
+            // Find characters that can be case-toggled
+            List<Integer> toggleablePositions = new ArrayList<>();
+            for (int i = 0; i < original.length(); i++) {
+                char c = original.charAt(i);
+                if (Character.isLetter(c)) {
+                    toggleablePositions.add(i);
+                }
+            }
+            
+            // Randomly toggle one character's case
+            if (!toggleablePositions.isEmpty()) {
+                Random rand = new Random();
+                int randomPos = toggleablePositions.get(rand.nextInt(toggleablePositions.size()));
+                char[] chars = original.toCharArray();
+                char c = chars[randomPos];
+                
+                if (Character.isLowerCase(c)) {
+                    chars[randomPos] = Character.toUpperCase(c);
+                } else if (Character.isUpperCase(c)) {
+                    chars[randomPos] = Character.toLowerCase(c);
+                }
+                
+                String singleCharToggle = new String(chars);
+                if (!singleCharToggle.equals(original)) {
+                    variations.add(singleCharToggle);
+                    if (DEBUG_STRING_MUTATION) {
+                        System.out.println("    [MUTATION] Single char case toggle at pos " + randomPos + ": \"" + original + "\" -> \"" + singleCharToggle + "\"");
+                    }
+                }
+            }
+        }
+        
+        // Add prefix/suffix variations using collected special characters
+        if (!original.isEmpty()) {
+            Set<Character> specialChars = getSpecialCharactersFromDirectToValues();
+            
+            // Ensure _ and @ are always included for string variations
+            Set<Character> enhancedSpecialChars = new HashSet<>(specialChars);
+            enhancedSpecialChars.add('_');
+            if(!enhancedSpecialChars.isEmpty()) {
+
+                for (Character specialChar : enhancedSpecialChars) {
+                    String prefixed = specialChar + original;
+                    variations.add(prefixed);
+                    if (DEBUG_STRING_MUTATION) {
+                        System.out.println("    [MUTATION] Special char prefix '" + specialChar + "': \"" + original + "\" -> \"" + prefixed + "\"");
+                    }
+                    
+                    String suffixed = original + specialChar;
+                    variations.add(suffixed);
+                    if (DEBUG_STRING_MUTATION) {
+                        System.out.println("    [MUTATION] Special char suffix '" + specialChar + "': \"" + original + "\" -> \"" + suffixed + "\"");
+                    }
+                }
+            }
+       
+        }
+        
+        // Additional variations for longer strings  
+        if (original.length() > 1) {
+            
+            String numbered = original + "0";
+            variations.add(numbered);
+            if (DEBUG_STRING_MUTATION) {
+                System.out.println("    [MUTATION] Number suffix: \"" + original + "\" -> \"" + numbered + "\"");
+            }
+            
+            // Randomly shuffle characters for all strings
+            List<Character> charList = new ArrayList<>();
+            for (char c : original.toCharArray()) {
+                charList.add(c);
+            }
+
+            Collections.shuffle(charList);
+
+            StringBuilder shuffled = new StringBuilder();
+            for (char c : charList) {
+                shuffled.append(c);
+            }
+            variations.add(shuffled.toString());
+
+            if (DEBUG_STRING_MUTATION) {
+                System.out.println("    [MUTATION] Shuffle characters: \"" + original + "\" -> \"" + shuffled + "\"");
+            }
+
+            // Space prefix (always add)
+            String spaced = " " + original;
+            variations.add(spaced);
+            if (DEBUG_STRING_MUTATION) {
+                System.out.println("    [MUTATION] Space prefix: \"" + original + "\" -> \"" + spaced + "\"");
+            }
+        }
+        
+        return variations;
+    }
+
+    /**
+     * Augment primitive values in the direct pool with boundary values
+     * Adds 0, MAX, MIN, -MAX, -MIN, -1 values for numeric types
+     */
+    public static void augmentPrimitiveDirectPool() {
+        try {
+            HashMap<CtTypeReference, Set<CtElement>> directToValues = CandidatePool.getDirectToValues();
+            
+            if (factory == null) {
+                factory = new Launcher().getFactory();
+            }
+            
+            int totalVariationsAdded = 0;
+            String[] primitiveTypes = {"int", "java.lang.Integer", "long", "java.lang.Long", 
+                                     "double", "java.lang.Double", "float", "java.lang.Float",
+                                     "short", "java.lang.Short", "byte", "java.lang.Byte"};
+            
+            // First check existing types in the pool
+            for (Map.Entry<CtTypeReference, Set<CtElement>> entry : directToValues.entrySet()) {
+                CtTypeReference<?> type = entry.getKey();
+                Set<CtElement> values = entry.getValue();
+                String typeName = type.getQualifiedName();
+                
+                Set<CtElement> newVariations = generateVariationsForType(typeName);
+                
+                if (!newVariations.isEmpty()) {
+                    values.addAll(newVariations);
+                    totalVariationsAdded += newVariations.size();
+                    // System.out.println("[INFO] Added " + newVariations.size() + " " + typeName + " variations to existing pool");
+                }
+            }
+            
+            // Then add primitive types that don't exist in the pool
+            for (String primitiveTypeName : primitiveTypes) {
+                boolean typeExists = false;
+                for (CtTypeReference<?> existingType : directToValues.keySet()) {
+                    if (primitiveTypeName.equals(existingType.getQualifiedName())) {
+                        typeExists = true;
+                        break;
+                    }
+                }
+                
+                if (!typeExists) {
+                    // Create new type reference and add variations
+                    CtTypeReference<?> newTypeRef;
+                    try {
+                        if (primitiveTypeName.contains(".")) {
+                            // Wrapper classes like java.lang.Integer
+                            newTypeRef = factory.Type().createReference(Class.forName(primitiveTypeName));
+                        } else {
+                            // Primitive types like int
+                            switch (primitiveTypeName) {
+                                case "int":
+                                    newTypeRef = factory.Type().createReference(int.class);
+                                    break;
+                                case "long":
+                                    newTypeRef = factory.Type().createReference(long.class);
+                                    break;
+                                case "double":
+                                    newTypeRef = factory.Type().createReference(double.class);
+                                    break;
+                                case "float":
+                                    newTypeRef = factory.Type().createReference(float.class);
+                                    break;
+                                case "short":
+                                    newTypeRef = factory.Type().createReference(short.class);
+                                    break;
+                                case "byte":
+                                    newTypeRef = factory.Type().createReference(byte.class);
+                                    break;
+                                default:
+                                    continue; // Skip unknown types
+                            }
+                        }
+                        
+                        Set<CtElement> newVariations = generateVariationsForType(primitiveTypeName);
+                        
+                        if (!newVariations.isEmpty()) {
+                            directToValues.put(newTypeRef, newVariations);
+                            totalVariationsAdded += newVariations.size();
+                            // System.out.println("[INFO] Created new " + primitiveTypeName + " pool with " + newVariations.size() + " variations");
+                        }
+                    } catch (ClassNotFoundException e) {
+                        System.err.println("[WARNING] Could not create type reference for: " + primitiveTypeName);
+                    }
+                }
+            }
+            
+            if (totalVariationsAdded > 0) {
+                System.out.println("[INFO] Total primitive variations added: " + totalVariationsAdded);
+            } else {
+                System.out.println("[INFO] No primitive variations could be added");
+            }
+            
+        } catch (Exception e) {
+            System.err.println("[ERROR] Failed to augment primitive direct pool: " + e.getMessage());
+            // e.printStackTrace();
+        }
+    }
+    
+    private static Set<CtElement> generateVariationsForType(String typeName) {
+        switch (typeName) {
+            case "int":
+            case "java.lang.Integer":
+                return generateIntVariations();
+            case "long":
+            case "java.lang.Long":
+                return generateLongVariations();
+            case "double":
+            case "java.lang.Double":
+                return generateDoubleVariations();
+            case "float":
+            case "java.lang.Float":
+                return generateFloatVariations();
+            case "short":
+            case "java.lang.Short":
+                return generateShortVariations();
+            case "byte":
+            case "java.lang.Byte":
+                return generateByteVariations();
+            default:
+                return new HashSet<>();
+        }
+    }
+    
+    private static Set<CtElement> generateIntVariations() {
+        Set<CtElement> variations = new HashSet<>();
+        variations.add(factory.createLiteral(0));
+        variations.add(factory.createLiteral(-1));
+        variations.add(factory.createLiteral(1));
+        variations.add(factory.createLiteral(Integer.MAX_VALUE));
+        variations.add(factory.createLiteral(Integer.MIN_VALUE));
+        variations.add(factory.createLiteral(-Integer.MAX_VALUE));
+        return variations;
+    }
+    
+    private static Set<CtElement> generateLongVariations() {
+        Set<CtElement> variations = new HashSet<>();
+        variations.add(factory.createLiteral(0L));
+        variations.add(factory.createLiteral(-1L));
+        variations.add(factory.createLiteral(1L));
+        variations.add(factory.createLiteral(Long.MAX_VALUE));
+        variations.add(factory.createLiteral(Long.MIN_VALUE));
+        variations.add(factory.createLiteral(-Long.MAX_VALUE));
+        return variations;
+    }
+    
+    private static Set<CtElement> generateDoubleVariations() {
+        Set<CtElement> variations = new HashSet<>();
+        variations.add(factory.createLiteral(0.0));
+        variations.add(factory.createLiteral(-1.0));
+        variations.add(factory.createLiteral(1.0));
+        variations.add(factory.createLiteral(Double.MAX_VALUE));
+        variations.add(factory.createLiteral(Double.MIN_VALUE));
+        variations.add(factory.createLiteral(-Double.MAX_VALUE));
+        variations.add(factory.createLiteral(Double.NaN));
+        return variations;
+    }
+    
+    private static Set<CtElement> generateFloatVariations() {
+        Set<CtElement> variations = new HashSet<>();
+        variations.add(factory.createLiteral(0.0f));
+        variations.add(factory.createLiteral(-1.0f));
+        variations.add(factory.createLiteral(1.0f));
+        variations.add(factory.createLiteral(Float.MAX_VALUE));
+        variations.add(factory.createLiteral(Float.MIN_VALUE));
+        variations.add(factory.createLiteral(-Float.MAX_VALUE));
+        variations.add(factory.createLiteral(Float.NaN));
+        return variations;
+    }
+    
+    private static Set<CtElement> generateShortVariations() {
+        Set<CtElement> variations = new HashSet<>();
+        variations.add(factory.createLiteral((short) 0));
+        variations.add(factory.createLiteral((short) -1));
+        variations.add(factory.createLiteral((short) 1));
+        variations.add(factory.createLiteral(Short.MAX_VALUE));
+        variations.add(factory.createLiteral(Short.MIN_VALUE));
+        variations.add(factory.createLiteral((short) -Short.MAX_VALUE));
+        return variations;
+    }
+    
+    private static Set<CtElement> generateByteVariations() {
+        Set<CtElement> variations = new HashSet<>();
+        variations.add(factory.createLiteral((byte) 0));
+        variations.add(factory.createLiteral((byte) -1));
+        variations.add(factory.createLiteral((byte) 1));
+        variations.add(factory.createLiteral(Byte.MAX_VALUE));
+        variations.add(factory.createLiteral(Byte.MIN_VALUE));
+        variations.add(factory.createLiteral((byte) -Byte.MAX_VALUE));
+        return variations;
+    }
+
+    /**
+     * Print collected constructor information from ASTParser
+     */
+    public static void printConstructorMapSummary() {
+        try {
+            Map<String, Set<CtConstructor<?>>> constructorsMap = ASTParser.getAll_Constructors_Map();
+            
+            System.out.println("\n--- Constructor Map Summary ---");
+            System.out.println("Total Types with Constructors: " + constructorsMap.size());
+            
+            if (constructorsMap.isEmpty()) {
+                System.out.println("No constructors found in the collected map.");
+                return;
+            }
+            
+            // Sort types by name for consistent output
+            List<String> sortedTypes = new ArrayList<>(constructorsMap.keySet());
+            sortedTypes.sort(String::compareTo);
+            
+            int totalConstructors = 0;
+            for (String typeName : sortedTypes) {
+                Set<CtConstructor<?>> constructors = constructorsMap.get(typeName);
+                if (constructors != null && !constructors.isEmpty()) {
+                    totalConstructors += constructors.size();
+                    System.out.println("  - Type: " + typeName);
+                    System.out.println("    - Constructors: " + constructors.size());
+                    
+                    // Sort constructors by parameter count
+                    List<CtConstructor<?>> sortedConstructors = new ArrayList<>(constructors);
+                    sortedConstructors.sort(Comparator.comparingInt(c -> c.getParameters().size()));
+                    
+                    for (CtConstructor<?> constructor : sortedConstructors) {
+                        StringBuilder signature = new StringBuilder();
+                        signature.append("      * ").append(typeName.substring(typeName.lastIndexOf('.') + 1)).append("(");
+                        
+                        List<CtParameter<?>> params = constructor.getParameters();
+                        for (int i = 0; i < params.size(); i++) {
+                            if (i > 0) signature.append(", ");
+                            String paramType = params.get(i).getType().getQualifiedName();
+                            signature.append(paramType.substring(paramType.lastIndexOf('.') + 1));
+                        }
+                        signature.append(")");
+                        
+                        // Add visibility info
+                        if (constructor.isPublic()) {
+                            signature.append(" [public]");
+                        } else if (constructor.isProtected()) {
+                            signature.append(" [protected]");
+                        } else if (constructor.isPrivate()) {
+                            signature.append(" [private]");
+                        } else {
+                            signature.append(" [package-private]");
+                        }
+                        
+                        System.out.println(signature.toString());
+                    }
+                }
+            }
+            
+            System.out.println("Total Constructors Found: " + totalConstructors);
+            
+        } catch (Exception e) {
+            System.err.println("[ERROR] Failed to print constructor map summary: " + e.getMessage());
+            // e.printStackTrace();
+        }
+    }
+
+    // =================================================================
+    // MUT-BASED POOL ANALYSIS AND AUGMENTATION METHODS
+    // =================================================================
+
+    /**
+     * Analyze required types from all MUTs and identify which types need more objects
+     */
+    private static void analyzeRequiredTypesFromMUTs() {
+        long analysisStartTime = System.currentTimeMillis();
+     
+        Set<MUTInput> muts = InputCombinations.getMuts();
+        if (muts == null || muts.isEmpty()) {
+        
+            return;
+        }
+        
+        Map<String, Integer> typeRequirementCount = new HashMap<>();
+        Map<String, Set<String>> typeToMutSignatures = new HashMap<>();
+        
+        // Analyze each MUT's parameter types
+        int totalInputsAnalyzed = 0;
+        for (MUTInput mut : muts) {
+            String mutSignature = mut.getMethodSignature();
+            LinkedHashMap<Integer, List<Input>> inputs = mut.getInputs();
+            
+            if (inputs != null) {
+                int inputsForThisMut = 0;
+                for (List<Input> inputList : inputs.values()) {
+                    for (Input input : inputList) {
+                        if (input.getType() != null) {
+                            String typeName = input.getType().getQualifiedName();
+                            typeRequirementCount.put(typeName, typeRequirementCount.getOrDefault(typeName, 0) + 1);
+                            
+                            // Track which MUTs use this type
+                            typeToMutSignatures.computeIfAbsent(typeName, k -> new HashSet<>()).add(mutSignature);
+                            
+                            inputsForThisMut++;
+                            totalInputsAnalyzed++;
+                        }
+                    }
+                }
+                
+    
+            }
+        }
+        
+        
+        // Analyze current pool sizes and identify insufficient types
+        int typesNeedingAugmentationCount = 0;
+        Map<String, Integer> poolAnalysisResults = new HashMap<>();
+        
+        
+        for (Map.Entry<String, Integer> entry : typeRequirementCount.entrySet()) {
+            String typeName = entry.getKey();
+            int requirementCount = entry.getValue();
+            
+            // Find the type reference
+            CtTypeReference<?> typeRef = findTypeReferenceByName(typeName);
+            if (typeRef != null) {
+                int currentPoolSize = analyzeCurrentPoolSizeForType(typeRef);
+                typePoolSizeCache.put(typeRef, currentPoolSize);
+                poolAnalysisResults.put(typeName, currentPoolSize);
+                
+                // Check if this type needs augmentation
+                boolean isArray = typeRef.isArray();
+                String typeKind = isArray ? "[ARRAY]" : "[SINGLE]";
+                
+                // Pool is insufficient if it's <= threshold (need more than 5)
+                if (currentPoolSize <= MIN_POOL_SIZE_THRESHOLD) {
+                    typesNeedingAugmentation.add(typeRef);
+                    typesNeedingAugmentationCount++;
+                    
+                    Set<String> usingMuts = typeToMutSignatures.get(typeName);
+                    String mutInfo = usingMuts != null ? " (used by " + usingMuts.size() + " MUTs)" : "";
+                    
+        
+                } 
+            } 
+        }
+        
+        long analysisEndTime = System.currentTimeMillis();
+        long analysisDuration = analysisEndTime - analysisStartTime;
+        
+        // Show types that need augmentation
+        if (typesNeedingAugmentationCount > 0) {
+      
+            for (CtTypeReference<?> needingType : typesNeedingAugmentation) {
+                String typeName = needingType.getQualifiedName();
+                int poolSize = poolAnalysisResults.getOrDefault(typeName, -1);
+                int requirementCount = typeRequirementCount.getOrDefault(typeName, 0);
+                String typeKind = needingType.isArray() ? " [ARRAY]" : " [SINGLE]";
+            }
+        }
+        
+        // Always show top 5 most required types
+        if (!typeRequirementCount.isEmpty()) {
+            typeRequirementCount.entrySet().stream()
+                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                .limit(5)
+                .forEach(e -> {
+                    int poolSize = poolAnalysisResults.getOrDefault(e.getKey(), -1);
+                    CtTypeReference<?> topTypeRef = findTypeReferenceByName(e.getKey());
+                    String typeKind = "";
+                    if (topTypeRef != null) {
+                        typeKind = topTypeRef.isArray() ? " [ARRAY]" : " [SINGLE]";
+                    }
+                    String status = poolSize <= MIN_POOL_SIZE_THRESHOLD ? "⚠️ " : "✅ ";
+                    String statusText = poolSize <= MIN_POOL_SIZE_THRESHOLD ? 
+                        (poolSize == MIN_POOL_SIZE_THRESHOLD ? " [BORDERLINE]" : " [INSUFFICIENT]") : " [SUFFICIENT]";
+
+                });
+        }
+    }
+    
+    /**
+     * Find CtTypeReference by qualified name from existing pools
+     */
+    private static CtTypeReference<?> findTypeReferenceByName(String qualifiedName) {
+        // Search in baseVarTypeNamePoolAsList
+        if (baseVarTypeNamePoolAsList != null) {
+            for (CtTypeReference<?> typeRef : baseVarTypeNamePoolAsList.keySet()) {
+                if (typeRef.getQualifiedName().equals(qualifiedName)) {
+                    return typeRef;
+                }
+            }
+        }
+        
+        // Search in baseDirectToValuesAsList
+        if (baseDirectToValuesAsList != null) {
+            for (CtTypeReference<?> typeRef : baseDirectToValuesAsList.keySet()) {
+                if (typeRef.getQualifiedName().equals(qualifiedName)) {
+                    return typeRef;
+                }
+            }
+        }
+        
+        // If not found, try to create a new type reference
+        if (factory != null) {
+            try {
+                return factory.Type().createReference(qualifiedName);
+            } catch (Exception e) {
+                // Failed to create type reference
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Analyze current pool size for a specific type
+     */
+    private static int analyzeCurrentPoolSizeForType(CtTypeReference<?> targetType) {
+        String targetTypeName = targetType.getQualifiedName();
+        boolean targetIsArray = targetType.isArray();
+        
+        // Separate counting for different pool types
+        int variablePoolSize = 0;  // From baseVarTypeNamePoolAsList
+        int directValuePoolSize = 0;  // From baseDirectToValuesAsList
+        
+ 
+        
+        // Check baseVarTypeNamePoolAsList
+        if (baseVarTypeNamePoolAsList != null) {
+            for (Map.Entry<CtTypeReference, List<Pair<CtTypeReference, CtElement>>> entry : baseVarTypeNamePoolAsList.entrySet()) {
+                CtTypeReference<?> poolType = entry.getKey();
+                boolean poolIsArray = poolType.isArray();
+                String poolTypeName = poolType.getQualifiedName();
+                
+                if (isCompatibleType(poolType, targetType)) {
+                    List<Pair<CtTypeReference, CtElement>> candidates = entry.getValue();
+                    variablePoolSize += candidates.size();
+                    
+                    
+                } 
+            }
+        }
+        
+        // Check baseDirectToValuesAsList
+        if (baseDirectToValuesAsList != null) {
+            for (Map.Entry<CtTypeReference<?>, List<CtElement>> entry : baseDirectToValuesAsList.entrySet()) {
+                CtTypeReference<?> poolType = entry.getKey();
+                boolean poolIsArray = poolType.isArray();
+                String poolTypeName = poolType.getQualifiedName();
+                
+                if (isCompatibleType(poolType, targetType)) {
+                    directValuePoolSize += entry.getValue().size();
+                    
+                }
+            }
+        }
+        
+        // For MUT parameter filling, we should primarily consider variable pools
+        // Direct values are useful but variables are more flexible for object creation
+        int usablePoolSize = variablePoolSize;  // Primary pool for object creation
+        int totalPoolSize = variablePoolSize + directValuePoolSize;  // For reference
+        
+        
+        // Return usable pool size (variables) for augmentation decisions
+        return usablePoolSize;
+    }
+    
+    /**
+     * Generate additional objects for types with insufficient pool size
+     */
+    private static void generateAdditionalObjectsForInsufficientTypes() {
+        if (typesNeedingAugmentation.isEmpty()) {
+           
+            return;
+        }
+        
+ 
+        int totalObjectsGenerated = 0;
+        for (CtTypeReference<?> typeRef : typesNeedingAugmentation) {
+            int currentSize = typePoolSizeCache.getOrDefault(typeRef, 0);
+            int targetSize = SAFE_POOL_SIZE;  // Generate to safe size (6)
+            int objectsToGenerate = Math.max(0, targetSize - currentSize);
+            
+            if (objectsToGenerate > 0) {
+                int generatedForType = generateAdditionalObjectsForType(typeRef, objectsToGenerate);
+                totalObjectsGenerated += generatedForType;
+ 
+            }
+        }
+        
+  
+        
+ 
+    }
+    
+    /**
+     * Generate additional objects for a specific type using various strategies
+     */
+    private static int generateAdditionalObjectsForType(CtTypeReference<?> typeRef, int targetCount) {
+        long generationStartTime = System.currentTimeMillis();
+        String typeName = typeRef.getQualifiedName();
+        
+        
+        if (factory == null) {
+            factory = new Launcher().getFactory();
+        }
+        
+        int generatedCount = 0;
+        int factoryAttempts = 0, factorySuccesses = 0;
+        int constructorAttempts = 0, constructorSuccesses = 0;
+        int methodAttempts = 0, methodSuccesses = 0;
+        
+        for (int i = 0; i < targetCount && generatedCount < targetCount; i++) {
+            try {
+                // Strategy 1: Try factory methods
+                CtExpression<?> factoryResult = tryCreateFromFactoryMethod(typeRef, factory, factory.createBlock(), 0);
+                if (factoryResult != null && addObjectToPool(typeRef, factoryResult, "factory_" + i)) {
+                    generatedCount++;
+                    continue;
+                }
+                
+                // Strategy 2: Try constructors with different approaches
+                CtExpression<?> constructorResult = tryCreateViaEnhancedConstructor(typeRef, i);
+                if (constructorResult != null && addObjectToPool(typeRef, constructorResult, "constructor_" + i)) {
+                    generatedCount++;
+                    continue;
+                }
+                
+                // Strategy 3: Try method invocations if recursive calls enabled
+                if (recursiveMethodCalls) {
+                    CtExpression<?> methodResult = tryCreateViaMethodInvocation(typeRef, i);
+                    if (methodResult != null && addObjectToPool(typeRef, methodResult, "method_" + i)) {
+                        generatedCount++;
+                        continue;
+                    }
+                }
+                
+            } catch (Exception e) {
+               
+            }
+        }
+        
+        long generationEndTime = System.currentTimeMillis();
+        long generationDuration = generationEndTime - generationStartTime;
+        totalGenerationTime += generationDuration;
+        
+        
+        return generatedCount;
+    }
+    
+    /**
+     * Try creating object via enhanced constructor approach with variation
+     */
+    private static CtExpression<?> tryCreateViaEnhancedConstructor(CtTypeReference<?> typeRef, int variation) {
+        Map<String, Set<CtConstructor<?>>> constructorsMap = ASTParser.getAll_Constructors_Map();
+        Set<CtConstructor<?>> constructors = constructorsMap.get(typeRef.getQualifiedName());
+        
+        if (constructors != null && !constructors.isEmpty()) {
+            List<CtConstructor<?>> constructorList = new ArrayList<>(constructors);
+            // Use variation to select different constructors
+            CtConstructor<?> selectedConstructor = constructorList.get(variation % constructorList.size());
+            
+            try {
+                CtBlock<?> tempBody = factory.createBlock();
+                CtConstructorCall<?> constructorCall = createConstructorCallFromConstructor(
+                    selectedConstructor, factory, tempBody, 0, typeRef);
+                
+                if (constructorCall != null) {
+                    return constructorCall;
+                }
+            } catch (Exception e) {
+                // Failed with this constructor, try next approach
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Try creating object via method invocation
+     */
+    private static CtExpression<?> tryCreateViaMethodInvocation(CtTypeReference<?> typeRef, int variation) {
+        try {
+            CtMethod<?> method = findMatchingMethod(typeRef, factory);
+            if (method != null) {
+                CtBlock<?> tempBody = factory.createBlock();
+                return createMethodInvo(method, factory, tempBody, 0);
+            }
+        } catch (Exception e) {
+            // Failed to create via method invocation
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Add generated object to the candidate pool
+     */
+    private static boolean addObjectToPool(CtTypeReference<?> typeRef, CtExpression<?> objectExpr, String nameSuffix) {
+        try {
+            // Create a variable to hold the object
+            String varName = normalizeTypeNameForVariable(typeRef) + "_" + nameSuffix + "_" + System.nanoTime();
+            CtLocalVariable<?> objVar = factory.createLocalVariable();
+            objVar.setSimpleName(varName);
+            objVar.setType((CtTypeReference) typeRef.clone());
+            objVar.setDefaultExpression((CtExpression) objectExpr.clone());
+            
+            // Create the sequence
+            List<CtElement> sequence = new ArrayList<>();
+            sequence.add(objVar);
+            
+            // Add to CandidatePool
+            CtElement varElement = objVar.getReference();
+            Pair<CtTypeReference, CtElement> typeAndName = new Pair<>(typeRef, varElement);
+            
+            boolean success = CandidatePool.insertVarTypeToInputPool(typeAndName, sequence);
+            if (success) {
+                // Also update local cache
+                if (baseVarTypeNamePoolAsList.containsKey(typeRef)) {
+                    baseVarTypeNamePoolAsList.get(typeRef).add(typeAndName);
+                } else {
+                    List<Pair<CtTypeReference, CtElement>> newList = new ArrayList<>();
+                    newList.add(typeAndName);
+                    baseVarTypeNamePoolAsList.put(typeRef, newList);
+                }
+            }
+            
+            return success;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    /**
+     * Print detailed generation statistics for debugging
+     */
+    private static void printGenerationStatistics() {
+        System.out.println("[STATS] 📈 Object Generation Statistics:");
+        System.out.println("[STATS] ======================================");
+        
+        // Attempt vs Success stats
+        int totalAttempts = generationAttemptStats.values().stream().mapToInt(Integer::intValue).sum();
+        int totalSuccesses = generationSuccessStats.values().stream().mapToInt(Integer::intValue).sum();
+        
+        if (totalAttempts > 0) {
+            double successRate = (double) totalSuccesses / totalAttempts * 100;
+            System.out.println("[STATS] Overall Success Rate: " + String.format("%.1f%%", successRate) + " (" + totalSuccesses + "/" + totalAttempts + ")");
+        }
+        
+        // Strategy-specific stats
+        for (String strategy : Arrays.asList("factory", "constructor", "method")) {
+            int attempts = generationAttemptStats.getOrDefault(strategy, 0);
+            int successes = generationSuccessStats.getOrDefault(strategy, 0);
+            if (attempts > 0) {
+                double rate = (double) successes / attempts * 100;
+                System.out.println("[STATS] " + strategy.substring(0, 1).toUpperCase() + strategy.substring(1) + 
+                    " Strategy: " + String.format("%.1f%%", rate) + " (" + successes + "/" + attempts + ")");
+            }
+        }
+        
+        System.out.println("[STATS] Total Pool Augmentation Calls: " + totalPoolAugmentationCalls);
+        System.out.println("[STATS] Total Generation Time: " + totalGenerationTime + " ms");
+        
+        if (totalGenerationTime > 0 && totalSuccesses > 0) {
+            double avgTimePerObject = (double) totalGenerationTime / totalSuccesses;
+            System.out.println("[STATS] Average Time per Object: " + String.format("%.1f", avgTimePerObject) + " ms");
+        }
+        
+        System.out.println("[STATS] ======================================");
+    }
+    
+
+
+}

@@ -1,0 +1,175 @@
+너는 내 코딩 전문가가 되어 내가 코드를 작성하는데 도움을 주게 될꺼야.
+
+우리는 주로 자바 언어를 다루게 될꺼고 Spoon 라이브러리를 통해 AST를 여러 방면으로 조작하게 될꺼야.
+
+
+
+GOAL:
+
+
+
+내가 작성한 코드를 보고 workflow를 이해한 다음 내가 마주한 문제를 해결하도록 도움을 줘
+
+
+
+지금까지 내가 작성한 코드와 코드의 workflow에 대해 설명을 해줄게:
+
+1. 개발자 테스트를 입력으로 받는다.
+
+2. 스푼을 통해 AST 모델을 생성한다.
+
+3. 개발자 테스트에 존재하는 헬퍼 메소드, 필드 값 등의 선언부 호출부를 리네이밍 한다.
+
+4. 이름 변경 계획을 새운다.
+
+5. 변경 계획을 수행한다.
+
+6. junit3 스타일로 작성된 개발자 테스트를 junitt4 스타일로 변경한다.
+
+7. 테스트 메소드를 변경된 개발자 테스트에서 분리해내어 각각 따로 저장을 한다.
+
+7.5 이름이 미처 변경되지 못한 호출부를 찾아서 이름 수정 및, 모든 private 타입을 public으로 변경한다
+
+8. 분리된 개발자 테스트 클래스를 원본 위치에 덮어쓰기하고 컴파일한다.
+
+
+
+
+
+하지만 다음과 같은 코드를 작성하고 실행하는데 문제가 있어 그 유형은 다음과 같아:
+
+1. Nested Class가 Implement 하는 대상은 우리가 분석하고 있는 Config.BASE_TESTS 에 포함된 대상이 아니라 Rename 을 하면 안되는데
+Rename 이 되어 버린 경우
+
+수정된 코드 :
+
+public class XYStepChartTests {
+...
+public static class XYStepChartTests_LocalListener implements ChartChangeListener {
+        public boolean XYStepChartTests_flag = false;
+
+        public void XYStepChartTests_chartChanged(ChartChangeEvent event) {
+            XYStepChartTests_LocalListener.this.XYStepChartTests_flag = true;
+        }
+    }
+...
+
+원본 코드:
+public class XYStepChartTests {
+...
+public static class LocalListener implements ChartChangeListener {
+        public boolean flag = false;
+        @Override
+        public void chartChanged(ChartChangeEvent event) {
+            this.flag = true;
+        }
+    }
+...
+
+의도된 코드:
+
+public class XYStepChartTests {
+...
+public static class XYStepChartTests_LocalListener implements ChartChangeListener {
+        public boolean XYStepChartTests_flag = false;
+        @Override
+        public void chartChanged(ChartChangeEvent event) {
+            XYStepChartTests_LocalListener.this.XYStepChartTests_flag = true;
+        }
+    }
+...
+
+
+오류 로그:
+  location: variable l of type org.jfree.chart.junit.XYStepChartTests.XYStepChartTests_LocalListener, /XYStepChartTests.java:93: error: org.jfree.chart.junit.XYStepChartTests.XYStepChartTests_LocalListener is not abstract and does not override abstract method chartChanged(org.jfree.chart.event.ChartChangeEvent) in org.jfree.chart.event.ChartChangeListener
+    public static class XYStepChartTests_LocalListener implements ChartChangeListener {
+                  ^]
+
+
+2. 여전히 남아 있는 오류:
+
+
+
+[/IntegrationTest.java:15: error: com.google.javascript.jscomp.IntegrationTest is not abstract and does not override abstract method IntegrationTestCase_createCompilerOptions() in com.google.javascript.jscomp.IntegrationTestCase
+
+public class IntegrationTest extends com.google.javascript.jscomp.IntegrationTestCase {
+
+       ^]
+
+Compilation failed for: /home/sangjune/data1/non_regression/gen_tests/defects4j_2.0.1/booster_BT_Removed_RelevantTests_Extended_JUNE16/100/Closure/tar_extracted/1b/00/com/google/javascript/jscomp/IntegrationTest.java
+
+[/RemoveUnusedVarsTest.java:8: error: com.google.javascript.jscomp.RemoveUnusedVarsTest is not abstract and does not override abstract method CompilerTestCase_getProcessor(com.google.javascript.jscomp.Compiler) in com.google.javascript.jscomp.CompilerTestCase
+
+public class RemoveUnusedVarsTest extends com.google.javascript.jscomp.CompilerTestCase {
+
+       ^]
+
+Compilation failed for: /home/sangjune/data1/non_regression/gen_tests/defects4j_2.0.1/booster_BT_Removed_RelevantTests_Extended_JUNE16/100/Closure/tar_extracted/1b/00/com/google/javascript/jscomp/RemoveUnusedVarsTest.java
+
+[/OptimizeCallsTest.java:9: error: com.google.javascript.jscomp.OptimizeCallsTest is not abstract and does not override abstract method CompilerTestCase_getProcessor(com.google.javascript.jscomp.Compiler) in com.google.javascript.jscomp.CompilerTestCase
+
+public class OptimizeCallsTest extends com.google.javascript.jscomp.CompilerTestCase {
+
+       ^]
+
+Compilation failed for: /home/sangjune/data1/non_regression/gen_tests/defects4j_2.0.1/booster_BT_Removed_RelevantTests_Extended_JUNE16/100/Closure/tar_extracted/1b/00/com/google/javascript/jscomp/OptimizeCallsTest.java
+
+ALL DONE!
+
+
+
+
+
+원본 :
+
+public class IntegrationTest extends IntegrationTestCase {
+
+  @Override
+
+  protected CompilerOptions createCompilerOptions() {
+
+    CompilerOptions options = new CompilerOptions();
+
+    options.setCodingConvention(new GoogleCodingConvention());
+
+    return options;
+
+  }
+
+
+
+수정본:
+
+public class IntegrationTest extends IntegrationTestCase {
+
+protected com.google.javascript.jscomp.CompilerOptions createCompilerOptions() {
+
+        com.google.javascript.jscomp.CompilerOptions options = new com.google.javascript.jscomp.CompilerOptions();
+
+        options.setCodingConvention(new com.google.javascript.jscomp.GoogleCodingConvention());
+
+        return options;
+
+    }
+
+
+
+
+
+주의해야할점 IntegrationTest가 Extend 하는 대상은 우리가 rename 하는 fileTypeMap에 포함되어 있음 따라서 createCompilerOptions가 IntegrationTestCase_createCompilerOptions로 리네임 되어야 함
+
+
+오류 로그:
+
+[/XYStepChartTests.java:93: error: org.jfree.chart.junit.XYStepChartTests.XYStepChartTests_LocalListener is not abstract and does not override abstract method chartChanged(org.jfree.chart.event.ChartChangeEvent) in org.jfree.chart.event.ChartChangeListener
+    public static class XYStepChartTests_LocalListener implements org.jfree.chart.event.ChartChangeListener {
+                  ^]
+Compilation failed for: /home/sangjune/data1/non_regression/gen_tests/defects4j_2.0.1/booster_BT_Removed_RelevantTests_Extended_JUNE16/100/Chart/tar_extracted/1b/00/org/jfree/chart/junit/XYStepChartTests.java
+
+오류 원인
+
+수정본:
+
+원본:
+
+
